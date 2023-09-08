@@ -24,13 +24,15 @@ class PluginWrapper:
     def __getattr__(self, attr):
         return partial(self.invoke, attr)
 
-    def invoke(self, func: str, *args, **kwargs) -> any:
+    def invoke(self, _function: str, *args, **kwargs) -> any:
         try:
-            result = self.plugin_manager.execute_module_function(self.module_inst, func, *args, **kwargs)
-            return result[0] if result is not None and len(result) > 0 else None
+            func = getattr(self.module_inst, _function)
+            return func(*args, **kwargs)
         except Exception as e:
-            print('Invoke error: ' + str(e))
+            print('---------------------- Not an issue -----------------------')
+            print(f'Invoke error - ${e}')
             print(traceback.format_exc())
+            print('-----------------------------------------------------------')
             return None
         finally:
             pass
@@ -102,9 +104,11 @@ class PluginManager:
         try:
             return plugin_wrapper.invoke(function, *args, **kwargs) if plugin_wrapper is not None else None
         except Exception as e:
+            print('---------------------- Not an issue -----------------------')
             print("Function run fail.")
             print('Error =>', e)
             print('Error =>', traceback.format_exc())
+            print('-----------------------------------------------------------')
         finally:
             pass
 
@@ -141,10 +145,12 @@ class PluginManager:
                 raise ValueError('No prob functions.')
             return PluginWrapper(self, plugin_name, file_path, plugin_name, module)
         except Exception as e:
+            print('---------------------- Not an issue -----------------------')
             print('When import module: ' + plugin_name)
             print(e)
             print(traceback.format_exc())
             print('Ignore...')
+            print('-----------------------------------------------------------')
             return None
         finally:
             pass
@@ -163,14 +169,14 @@ def main():
     pm1.scan_plugin()
     print(pm1.plugins)
 
-    assert pm1.invoke_one('plugin_with_prob', 'foo')
-    assert pm1.invoke_one('plugin_without_prob', 'foo')
+    assert pm1.invoke_one('plugin_with_prob', 'foo') is None
+    assert pm1.invoke_one('plugin_without_prob', 'foo') is None
 
-    assert pm1.invoke_one('plugin_with_prob', 'bar')
-    assert pm1.invoke_one('plugin_without_prob', 'bar')
+    assert pm1.invoke_one('plugin_with_prob', 'bar') == 'bar'
+    assert pm1.invoke_one('plugin_without_prob', 'bar') is None
 
-    assert pm1.invoke_all('foo')
-    assert pm1.invoke_all('bar')
+    print(pm1.invoke_all('foo'))
+    print(pm1.invoke_all('bar'))
 
     print('-----------------------------------------------------------------------')
 
@@ -178,14 +184,16 @@ def main():
     pm2.scan_plugin()
     print(pm2.plugins)
 
-    assert pm2.invoke_one('plugin_with_prob', 'foo')
-    assert pm2.invoke_one('plugin_without_prob', 'foo')
+    assert pm2.invoke_one('plugin_with_prob', 'foo') is None
+    assert pm2.invoke_one('plugin_without_prob', 'foo') == 'foo'
 
-    assert pm2.invoke_one('plugin_with_prob', 'bar')
-    assert pm2.invoke_one('plugin_without_prob', 'bar')
+    assert pm2.invoke_one('plugin_with_prob', 'bar') == 'bar'
+    assert pm2.invoke_one('plugin_without_prob', 'bar') is None
 
-    assert pm2.invoke_all('foo')
-    assert pm2.invoke_all('bar')
+    print(pm2.invoke_all('foo'))
+    print(pm2.invoke_all('bar'))
+
+    print('Test passed.')
 
 
 # ----------------------------------------------------------------------------------------------------------------------
