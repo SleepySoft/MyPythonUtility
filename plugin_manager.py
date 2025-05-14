@@ -1,23 +1,99 @@
 import os
+import sys
 import traceback
 import importlib.util
+import logging
 from functools import partial
 from inspect import getmembers, isfunction
+from typing import List, Optional, Union
 
-from typing import List, Union
-
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DEFAULT_PLUGIN_PROB_FUNCTIONS = ['plugin_prob', 'plugin_capacities']
 
+"""
+Plugin Management System
 
-# ----------------------------------------------------------------------------------------------------------------------
+Exposed Interfaces Documentation
+
+CLASSES:
+
+1. PluginManager
+   Core class for managing plugin lifecycle operations
+
+   Methods:
+   - scan_path(dir_path: str) -> List[PluginWrapper]
+     Scans a directory for Python files and loads valid plugins
+
+   - add_plugin(file_path: str) -> None
+     Loads a single plugin from specified file path
+
+   - remove_plugin(name_or_path: str) -> None
+     Unloads plugin by name or file path
+
+   - get_plugin(name_or_path: str) -> Optional[PluginWrapper]
+     Retrieves plugin instance by name or path
+
+   - list_plugins() -> List[str]
+     Returns names of all loaded plugins
+
+   - invoke_one(plugin_name: str, function: str, *args, **kwargs) -> Any
+     Executes specified function from a single plugin
+
+   - invoke_all(function: str, *args, **kwargs) -> List[Any]
+     Executes specified function from all loaded plugins
+
+   Static Methods:
+   - plugin_name(plugin_path: str) -> str
+     Extracts plugin name from file path
+
+   - safe_invoke(plugin_wrapper: PluginWrapper, function: str, *args, **kwargs) -> Any
+     Safe execution wrapper with error handling
+
+2. PluginWrapper
+   Plugin instance container providing execution interface
+
+   Methods:
+   - invoke(_function: str, *args, **kwargs) -> Any
+     Directly executes specified plugin function
+
+   - has_function(function: str) -> bool
+     Checks if plugin contains callable function
+
+   - get_attribute(attribute: str) -> Any
+     Retrieves attribute value from plugin module
+
+   Magic Methods:
+   - __getattr__(attr) -> partial
+     Enables method-style calling: plugin.function_name(args)
+
+PARAMETER SPECIFICATIONS:
+
+- All path parameters accept both absolute and relative paths
+- Function parameters support both positional and keyword arguments
+- Return values preserve original plugin function return types
+- Failed executions return None with logged errors
+
+PLUGIN REQUIREMENTS:
+- Must implement all functions specified in prob_functions
+- Should contain at least one callable function
+- Must be valid Python module (.py file)
+- Should not use reserved names (starting with '_' or '.')
+
+ERROR HANDLING:
+- Invalid plugins are skipped during loading
+- Execution errors are logged with stack traces
+- Missing functions/attributes return None silently
+- Path errors raise standard OS exceptions
+"""
+
 
 class PluginWrapper:
-    def __init__(self, plugin_manager, plugin_name: str, module_path: str, module_name: str, module_inst):
+    def __init__(self, plugin_manager, plugin_name: str, module_path: str, module_inst):
         self.plugin_manager = plugin_manager
         self.plugin_name = plugin_name
         self.module_path = module_path
-        self.module_name = module_name
         self.module_inst = module_inst
         self.user_data = {}
 
@@ -29,144 +105,140 @@ class PluginWrapper:
             func = getattr(self.module_inst, _function)
             return func(*args, **kwargs)
         except Exception as e:
-            print('---------------------- Not an issue -----------------------')
-            print(f'Invoke error - ${e}')
-            print(traceback.format_exc())
-            print('-----------------------------------------------------------')
+            logger.warning(f'Invoke error in {self.plugin_name}.{_function}: {e}')
             return None
-        finally:
-            pass
 
     def has_function(self, function: str) -> bool:
-        try:
-            return callable(getattr(self.module_inst, function))
-        except Exception as e:
-            return False
-        finally:
-            pass
+        return hasattr(self.module_inst, function) and callable(getattr(self.module_inst, function))
 
     def get_attribute(self, attribute: str) -> any:
         try:
-            return callable(getattr(self.module_inst, attribute))
-        except Exception as e:
+            return getattr(self.module_inst, attribute)
+        except AttributeError:
             return None
-        finally:
-            pass
 
-
-# ----------------------------------------------------------------------------------------------------------------------
 
 class PluginManager:
-    def __init__(self, plugin_path: Union[str, List[str]] = '', prob_functions: [str] or None = None):
-        self.plugin_path = plugin_path
+    def __init__(self, prob_functions: Optional[List[str]] = None):
         self.prob_functions = DEFAULT_PLUGIN_PROB_FUNCTIONS if prob_functions is None else prob_functions
         self.plugins = {}
 
-    def get_plugin(self, plugin_name: str) -> PluginWrapper:
-        return self.plugins.get(plugin_name, None)
-
-    def list_plugin(self) -> [str]:
-        return [f.removesuffix('.py') for f in self.__list_py_files()]
-
-    def load_plugin(self, plugin_name: str) -> PluginWrapper or None:
-        if os.path.isabs(plugin_name):
-            file_path = plugin_name
-        else:
-            file_path = os.path.join(self.plugin_path, plugin_name)
-            if not file_path.endswith('.py'):
-                file_path += '.py'
-        plugin_data = self.__load_plugin_file(file_path)
-        self.__check_update_plugins(file_path, plugin_data)
-        return plugin_data
-
-    def scan_plugin(self) -> []:
+    def scan_path(self, dir_path: str) -> List[PluginWrapper]:
         plugin_list = []
-        for py_file in self.__list_py_files():
-            plugin_data = self.__load_plugin_file(py_file)
-            self.__check_update_plugins(py_file, plugin_data)
-            plugin_list.append(plugin_data)
+        for py_file in self.__list_py_files(dir_path):
+            self.__add_plugin(py_file)
+            plugin = self.__get_plugin(py_file)
+            if plugin:
+                plugin_list.append(plugin)
         return plugin_list
+
+    def add_plugin(self, file_path: str) -> None:
+        self.__add_plugin(file_path)
+
+    def remove_plugin(self, name_or_path: str) -> None:
+        self.__remove_plugin(name_or_path)
+
+    def get_plugin(self, name_or_path: str) -> Optional[PluginWrapper]:
+        return self.__get_plugin(name_or_path)
+
+    def list_plugins(self) -> List[str]:
+        return [plugin.plugin_name for plugin in self.plugins.values()]
 
     def invoke_one(self, plugin_name: str, function: str, *args, **kwargs) -> any:
         plugin_wrapper = self.__get_plugin_by_name(plugin_name)
-        return PluginManager.safe_invoke(plugin_wrapper, function, *args, **kwargs)
+        return self.safe_invoke(plugin_wrapper, function, *args, **kwargs)
 
-    def invoke_all(self, function: str, *args, **kwargs) -> []:
-        return [PluginManager.safe_invoke(plugin_wrapper, function, *args, **kwargs)
-                for plugin_wrapper in self.plugins.values()]
+    def invoke_all(self, function: str, *args, **kwargs) -> List[any]:
+        return [self.safe_invoke(plugin, function, *args, **kwargs) for plugin in self.plugins.values()]
 
     @staticmethod
     def plugin_name(plugin_path: str) -> str:
         return os.path.splitext(os.path.basename(plugin_path))[0]
 
     @staticmethod
-    def safe_invoke(plugin_wrapper: PluginWrapper, function: str, *args, **kwargs) -> any:
-        try:
-            return plugin_wrapper.invoke(function, *args, **kwargs) if plugin_wrapper is not None else None
-        except Exception as e:
-            print('---------------------- Not an issue -----------------------')
-            print("Function run fail.")
-            print('Error =>', e)
-            print('Error =>', traceback.format_exc())
-            print('-----------------------------------------------------------')
-        finally:
-            pass
-
-    # --------------------------------------------------------------------------------
-
-    def __list_py_files(self) -> []:
-        py_files = []
-        module_files = os.listdir(self.plugin_path)
-        for file_name in module_files:
-            if not file_name.endswith('.py') or file_name.startswith('_') or file_name.startswith('.'):
-                continue
-            py_files.append(os.path.join(self.plugin_path, file_name))
-        return py_files
-
-    def __get_plugin_by_name(self, plugin_name: str) -> PluginWrapper or None:
-        ensure_plugin_name = PluginManager.plugin_name(plugin_name)
-        return self.plugins.get(ensure_plugin_name, None)
-
-    def __check_update_plugins(self, plugin_name: str, plugin_wrapper: PluginWrapper or None):
-        ensure_plugin_name = PluginManager.plugin_name(plugin_name)
+    def safe_invoke(plugin_wrapper: Optional[PluginWrapper], function: str, *args, **kwargs) -> any:
         if plugin_wrapper is None:
-            if ensure_plugin_name in self.plugins.keys():
-                del self.plugins[ensure_plugin_name]
-        else:
-            self.plugins[ensure_plugin_name] = plugin_wrapper
-
-    def __load_plugin_file(self, file_path: str) -> PluginWrapper or None:
-        plugin_name = os.path.splitext(os.path.basename(file_path))[0]
-        try:
-            spec = importlib.util.spec_from_file_location(plugin_name, file_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            if module is None or not self.__check_prob_functions(module):
-                raise ValueError('No prob functions.')
-            return PluginWrapper(self, plugin_name, file_path, plugin_name, module)
-        except Exception as e:
-            print('---------------------- Not an issue -----------------------')
-            print('When import module: ' + plugin_name)
-            print(e)
-            print(traceback.format_exc())
-            print('Ignore...')
-            print('-----------------------------------------------------------')
             return None
-        finally:
-            pass
+        try:
+            return plugin_wrapper.invoke(function, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error invoking {function}: {e}", exc_info=True)
+            return None
+
+    # ----------------------------------- Private methods -----------------------------------
+
+    def __add_plugin(self, file_path: str) -> None:
+        abs_path = os.path.abspath(file_path)
+        if abs_path in self.plugins:
+            return
+        plugin = self.__load_plugin_file(abs_path)
+        if plugin:
+            self.plugins[abs_path] = plugin
+
+    def __remove_plugin(self, name_or_path: str) -> None:
+        abs_path = os.path.abspath(name_or_path)
+        self.plugins = {
+            k: v for k, v in self.plugins.items()
+            if k != abs_path and v.plugin_name != name_or_path
+        }
+
+    def __get_plugin(self, name_or_path: str) -> Optional[PluginWrapper]:
+        abs_path = os.path.abspath(name_or_path)
+        if abs_path in self.plugins:
+            return self.plugins[abs_path]
+        for plugin in self.plugins.values():
+            if plugin.plugin_name == name_or_path:
+                return plugin
+        return None
+
+    def __list_py_files(self, dir_path: str) -> List[str]:
+        if not os.path.isdir(dir_path):
+            return []
+        return [
+            os.path.join(dir_path, f)
+            for f in os.listdir(dir_path)
+            if f.endswith('.py') and not f.startswith(('_', '.'))
+        ]
+
+    def __load_plugin_file(self, file_path: str) -> Optional[PluginWrapper]:
+        plugin_name = self.plugin_name(file_path)
+        try:
+            # Generate unique module name to avoid conflicts
+            module_name = f"plugin_{os.path.abspath(file_path).replace(os.sep, '_')}"
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is None:
+                logger.error(f"Failed to load spec for {file_path}")
+                return None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            if not self.__check_prob_functions(module):
+                logger.warning(f"Plugin {plugin_name} lacks required functions")
+                return None
+            return PluginWrapper(self, plugin_name, file_path, module)
+        except Exception as e:
+            logger.warning(f"Error loading plugin {file_path}: {e}")
+            return None
 
     def __check_prob_functions(self, module) -> bool:
-        for pf in self.prob_functions:
-            if not callable(getattr(module, pf)):
-                return False
-        return True
+        return all(
+            hasattr(module, pf) and callable(getattr(module, pf))
+            for pf in self.prob_functions
+        )
+
+    def __get_plugin_by_name(self, plugin_name: str) -> Optional[PluginWrapper]:
+        for plugin in self.plugins.values():
+            if plugin.plugin_name == plugin_name:
+                return plugin
+        return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 
 def main():
-    pm1 = PluginManager('plugin_manager_test')
-    pm1.scan_plugin()
+    pm1 = PluginManager()
+    pm1.scan_path('plugin_manager_test')
+
     print(pm1.plugins)
 
     assert pm1.invoke_one('plugin_with_prob', 'foo') is None
@@ -180,8 +252,9 @@ def main():
 
     print('-----------------------------------------------------------------------')
 
-    pm2 = PluginManager('plugin_manager_test', [])
-    pm2.scan_plugin()
+    pm2 = PluginManager([])
+    pm2.scan_path('plugin_manager_test')
+
     print(pm2.plugins)
 
     assert pm2.invoke_one('plugin_with_prob', 'foo') is None
