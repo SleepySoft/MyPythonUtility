@@ -53,6 +53,19 @@ I found some similar components in my different projects. I made them into utili
 >
 > More details can be found in the source file.
 
+-----------------------------------------------------------------------------
+
+## FileBackup
+
+### File
+> [file_backup.py](file_backup.py)
+
+### Description
+> A tool for file backup. You can simply call this function to back up files in '<current_dir>/backup' 
+> folder and speccify a backup limit before updating it.
+> This function will automatically delete the oldest backup to fit the backup limit.
+>
+> More details can be found in the source file.
 
 
 
