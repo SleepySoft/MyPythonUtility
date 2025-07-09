@@ -1,9 +1,6 @@
-import threading
 import weakref
-from typing import Optional, Callable
-
+import traceback
 import threading
-import weakref
 from typing import Optional, Callable
 
 

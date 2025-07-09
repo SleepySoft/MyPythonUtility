@@ -40,6 +40,18 @@ I found some similar components in my different projects. I made them into utili
 >
 > More details can be found in the source file.
 
+-----------------------------------------------------------------------------
+
+## ObserverNotifier
+
+### File
+> [ObserverNotifier.py](ObserverNotifier.py)
+
+### Description
+> A tool that can call all observer's ```on_*``` functions through ```notify_*``` functions. 
+> With this class, we don't have to write each notify function and the observer manager by manual.
+>
+> More details can be found in the source file.
 
 
 
