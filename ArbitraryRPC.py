@@ -1,3 +1,5 @@
+"""JSON-based RPC framework for remote procedure calls over HTTP with Flask backend."""
+
 import json
 import logging
 import requests
@@ -15,6 +17,20 @@ REQUEST_KEY_KWARGS = 'kwargs'
 
 
 class RPCProxy:
+    """Client-side proxy for making remote procedure calls to a JSON-RPC server.
+
+    Args:
+        api_url (str): Endpoint URL of the RPC server (default 'http://localhost:8000/api')
+        timeout (int): Request timeout in seconds (0 = no timeout)
+        token (str, optional): Authentication token for server requests
+        header (dict, optional): Custom HTTP headers for POST requests
+
+    Attributes:
+        token (str): Authentication token
+        header (dict): HTTP headers
+        timeout (int): Request timeout
+        api_url (str): Server endpoint URL
+    """
     def __init__(self,
                  api_url: str = 'http://localhost:8000/api',
                  timeout: int = 0,
@@ -28,15 +44,20 @@ class RPCProxy:
     # ------------------------------------------------------------------------------------
 
     def __getattr__(self, attr):
+        """Dynamically creates partial function for remote method call.
+        """
         return partial(self.rpc_interface_proxy, attr)
 
     def rpc_interface_proxy(self, api: str, *args, **kwargs) -> any:
-        """
-        Cooperate with WebApiInterface.rest_interface_stub
-        :param api: The function name of interface that you want to call
-        :param args: The list args (which will be ignored in server side)
-        :param kwargs: The key-value args
-        :return: The response of server
+        """Executes RPC call to specified remote method.
+
+        Args:
+            api: Remote method name to call
+            *args: Positional arguments (will be serialized)
+            **kwargs: Keyword arguments (will be serialized)
+
+        Returns:
+            Deserialized response from server or raw text if deserialization fails
         """
         payload = {
             REQUEST_KEY_API: api,
@@ -64,7 +85,11 @@ class RPCProxy:
 
 
 class RPCService:
+    """Server-side RPC request handler with authentication and error handling."""
+
     class DefaultRPCStub:
+        """Placeholder implementation for demo/testing purposes."""
+
         def __getattr__(self, api: str):
             def print_rpc_call(*args, **kwargs) -> str:
                 result = f'RPC Call: {api}\n  args:\n{args}\n  kwargs:\n{kwargs}'
@@ -76,11 +101,26 @@ class RPCService:
                  rpc_stub: object,
                  token_checker: Callable[[str], bool],
                  error_handler: Callable[[str], None]):
+        """Initializes RPC service core.
+
+        Args:
+            rpc_stub: Object containing registered RPC methods
+            token_checker: Callback function for token validation
+            error_handler: Callback for processing runtime exceptions
+        """
         self.rpc_stub = rpc_stub or RPCService.DefaultRPCStub()
         self.token_checker = token_checker or (lambda _: True)
         self.error_handler = error_handler or (lambda error: print(error))
 
-    def handle_flash_request(self, flask_request):
+    def handle_flask_request(self, flask_request):
+        """Handles Flask request object directly.
+
+        Args:
+            flask_request: Raw Flask request object
+
+        Returns:
+            Serialized response data
+        """
         from flask import request
         flask_request: request
 
@@ -90,6 +130,14 @@ class RPCService:
         return self.handle_request_dict(req_dict)
 
     def handle_request_dict(self, req_data: dict) -> str:
+        """Processes request data in dictionary format.
+
+        Args:
+            req_data: Deserialized JSON-RPC request
+
+        Returns:
+            Serialized response data
+        """
         api = req_data.get(REQUEST_KEY_API, '')
         token = req_data.get(REQUEST_KEY_TOKEN, '')
         args_json = req_data.get(REQUEST_KEY_ARGS, '')
@@ -105,12 +153,22 @@ class RPCService:
 
     @staticmethod
     def check_request(api: str, token: str, args_json: str, kwargs_json: str) -> bool:
+        """Validates basic request parameters format.
+
+        Returns:
+            True if all parameters meet type requirements
+        """
         return isinstance(api, str) and api != '' and \
                isinstance(token, str) and token != '' and \
                isinstance(args_json, str) and isinstance(kwargs_json, str)
 
     @staticmethod
     def parse_request(args_json: str, kwargs_json: str) -> (bool, list, dict):
+        """Deserializes arguments from JSON strings.
+
+        Returns:
+            Tuple: (success status, deserialized args, deserialized kwargs)
+        """
         try:
             args = deserialize(args_json)
             kwargs = deserialize(kwargs_json)
@@ -120,6 +178,17 @@ class RPCService:
             return False, [], {}
 
     def dispatch_request(self, api: str, token: str, *args, **kwargs) -> any:
+        """Executes requested RPC method after validation.
+
+        Args:
+            api: Method name to invoke
+            token: Authentication token
+            *args: Deserialized positional arguments
+            **kwargs: Deserialized keyword arguments
+
+        Returns:
+            Serialized result of method execution
+        """
         try:
             func = getattr(self.rpc_stub, api, None)
             if callable(func):
@@ -142,20 +211,31 @@ except Exception as e:
 
 
 class FlaskRPCServer:
+    """Flask-based HTTP server for hosting JSON-RPC services."""
+
     def __init__(self, listen_ip: str, listen_port: int, rpc_service: RPCService):
+        """Configures RPC server instance.
+
+        Args:
+            listen_ip: Network interface binding address
+            listen_port: TCP port to listen on
+            rpc_service: Configured RPCService handler
+        """
         self.listen_ip = listen_ip
         self.listen_port = listen_port
         self.rpc_service = rpc_service
         self.service_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
-        self.init_service()
+        self._init_service()
 
-    def init_service(self):
+    def _init_service(self):
+        """Registers Flask route handler for '/api' endpoint.
+        """
         if flaskApp is not None:
             @flaskApp.route('/api', methods=['POST'])
             def webapi_entry():
                 try:
-                    response = self.rpc_service.handle_flash_request(request)
+                    response = self.rpc_service.handle_flask_request(request)
                 except Exception as e:
                     print('/api Error', e)
                     print(traceback.format_exc())
@@ -167,6 +247,11 @@ class FlaskRPCServer:
     # ------------------------------------------------------------------------------------------------------------------
 
     def run_service_blocking(self, debug: bool):
+        """Starts Flask server in blocking mode.
+
+        Args:
+            debug: Enable Flask debug mode
+        """
         if flaskApp is not None:
             print(f'Starting service: host = {self.listen_ip}, port = {self.listen_port}, debug = {debug}.')
 
@@ -181,6 +266,14 @@ class FlaskRPCServer:
             print('Error: Flask application not initialized!')
 
     def run_service_in_thread(self, debug: bool = False) -> threading.Thread:
+        """Launches service in background thread.
+
+        Args:
+            debug: Enable Flask debug mode
+
+        Returns:
+            Reference to running thread
+        """
         if self.service_thread and self.service_thread.is_alive():
             print('Service is already running!')
             return self.service_thread
@@ -197,38 +290,40 @@ class FlaskRPCServer:
         return self.service_thread
 
     def stop_service(self) -> None:
-        """停止运行的服务线程"""
+        """Attempts graceful termination of background service thread.
+        (Not completely implemented.)
+        """
         if self.service_thread and self.service_thread.is_alive():
             print('Stopping Flask service...')
-            # Flask 没有提供原生停止方法，我们需要强制中断
-            # 但在实际应用中，您应该使用成熟的WSGI服务器来处理生产环境中的优雅关闭
+            # Flask does not provide a native stop method, we need to force a shutdown
+            # But in real applications, you should use a mature WSGI server to handle graceful shutdown in production environments
 
-            # 设置停止事件（如果服务线程检查它）
+            # Set the stop event (if the service thread checks it)
             self.stop_event.set()
 
-            # 尝试优雅等待线程结束
+            # Try to wait gracefully for the thread to end
             self.service_thread.join(timeout=5.0)
 
             if self.service_thread.is_alive():
-                # 如果线程没有响应，强制终止（不推荐，但作为后备方案）
+                # If the thread is not responding, force it to terminate (not recommended, but as a fallback)
                 print('Warning: Forcibly terminating service thread...')
-                # 注意：在真实系统中应避免强制终止，可能导致资源泄漏
+                # Note: Avoid forced termination in real systems, as it may cause resource leaks
 
     def is_service_running(self) -> bool:
+        """Checks service thread status.
+
+        Returns:
+            True if service thread is active
+        """
         return self.service_thread is not None and self.service_thread.is_alive()
 
     # ------------------------------------------------------------------------------------------------------------------
 
     def _run_thread(self, debug: bool) -> None:
-        """线程执行函数"""
+        """Internal threading target that executes blocking service."""
         try:
-            # 添加自定义逻辑（如果需要）
             # self.pre_run_setup()
-
-            # 调用阻塞模式运行
             self.run_service_blocking(debug=debug)
-
-            # 添加清理逻辑（如果需要）
             # self.post_run_cleanup()
         except Exception as e:
             print(f'Service thread failed: {str(e)}')

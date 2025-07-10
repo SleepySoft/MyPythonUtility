@@ -67,8 +67,21 @@ I found some similar components in my different projects. I made them into utili
 >
 > More details can be found in the source file.
 
+-----------------------------------------------------------------------------
 
+## Arbitrary RPC
 
+### File
+> [ArbitraryRPC.py](ArbitraryRPC.py)
+> [JsonSerializer.py](JsonSerializer.py)
+> [JsonSerializerImpl.py](JsonSerializerImpl.py)
+
+### Description
+> A lightweight JSON-RPC framework for remote procedure calls.
+> With this tool, you can call remote functions just like local ones, without defining interface declarations or writing wrappers.
+> An implementation with Flask has been provided, but you can integrate with any backend.
+>
+> More details can be found in the source file.
 
 
 
