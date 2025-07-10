@@ -80,6 +80,7 @@ I found some similar components in my different projects. I made them into utili
 > A lightweight JSON-RPC framework for remote procedure calls.
 > With this tool, you can call remote functions just like local ones, without defining interface declarations or writing wrappers.
 > An implementation with Flask has been provided, but you can integrate with any backend.
+> You can read test code as example: [arbitrary_rpc_test/test_arbitrary_rpc.py](arbitrary_rpc_test/test_arbitrary_rpc.py)
 >
 > More details can be found in the source file.
 
