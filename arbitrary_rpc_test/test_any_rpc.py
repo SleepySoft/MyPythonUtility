@@ -3,7 +3,7 @@ import random
 import threading
 import numpy as np
 from datetime import datetime
-from AnyRPC import RPCProxy, RPCService, FlaskRPCService
+from ArbitraryRPC import RPCProxy, RPCService, FlaskRPCServer
 
 
 # ====================== 服务端实现 ======================
@@ -35,7 +35,7 @@ class TestService:
                 "d": {"e": 7}
             },
             "set": {1, 2, 3, 2, 1},  # 注意：集合可能会转换为列表
-            "date": datetime.now().isoformat()  # 时间对象转换为字符串
+            "date": datetime.datetime.now().isoformat()  # 时间对象转换为字符串
         }
 
     def large_data(self):
@@ -81,7 +81,7 @@ rpc_service = RPCService(
 )
 
 # 启动服务端（后台线程）
-flask_service = FlaskRPCService(
+flask_service = FlaskRPCServer(
     listen_ip='127.0.0.1',
     listen_port=9000,
     rpc_service=rpc_service
