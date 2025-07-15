@@ -116,6 +116,7 @@ class EasyConfig:
                     return default
                 d = d[k]
             if not isinstance(d, dict) or keys[-1] not in d:
+                logging.error(f"No config for '{key}' , use default: {str(default)}")
                 return default
             return d[keys[-1]]
         except Exception as e:
