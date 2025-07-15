@@ -6,6 +6,7 @@ import logging
 import tempfile
 import traceback
 from typing import Any, Optional
+from collections import OrderedDict
 
 
 class EasyConfig:
@@ -207,6 +208,30 @@ class EasyConfig:
             self.config_data = {}
             logging.warning(f"Config load failed: {e}")
             return False
+
+    def dump_text(self) -> str:
+        def flatten_dict(d, parent_key='', sep='.'):
+            items = []
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.extend(flatten_dict(v, new_key, sep=sep).items())
+                else:
+                    items.append((new_key, v))
+            return OrderedDict(items)
+
+        if not self.config_data:
+            return ""
+
+        flat_dict = flatten_dict(self.config_data)
+        max_key_len = max(len(key) for key in flat_dict.keys()) if flat_dict else 0
+
+        lines = []
+        for key, value in flat_dict.items():
+            value_str = f'"{value}"' if isinstance(value, str) else json.dumps(value)
+            lines.append(f"{key.ljust(max_key_len)} : {value_str}")
+
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
