@@ -99,8 +99,8 @@ class RPCService:
 
     def __init__(self,
                  rpc_stub: object,
-                 token_checker: Callable[[str], bool],
-                 error_handler: Callable[[str], None]):
+                 token_checker: Callable[[str], bool] = None,
+                 error_handler: Callable[[str], None] = None):
         """Initializes RPC service core.
 
         Args:
@@ -201,19 +201,15 @@ class RPCService:
             return f'Exception: {str(e)}'
 
 
-try:
-    from flask import Flask, request
-    flaskApp = Flask(__name__)
-    flaskApp.logger.setLevel(logging.ERROR)
-except Exception as e:
-    flaskApp = None
-    print(str(e))
-
-
 class FlaskRPCServer:
     """Flask-based HTTP server for hosting JSON-RPC services."""
 
-    def __init__(self, listen_ip: str, listen_port: int, rpc_service: RPCService):
+    def __init__(self, inst_name: str,
+                 listen_ip: str,
+                 listen_port: int,
+                 rpc_stub: object,
+                 token_checker: Callable[[str], bool] = None,
+                 error_handler: Callable[[str], None] = None):
         """Configures RPC server instance.
 
         Args:
@@ -221,18 +217,31 @@ class FlaskRPCServer:
             listen_port: TCP port to listen on
             rpc_service: Configured RPCService handler
         """
+        self.inst_name = inst_name
         self.listen_ip = listen_ip
         self.listen_port = listen_port
-        self.rpc_service = rpc_service
+
+        self.rpc_service = RPCService(
+            rpc_stub=rpc_stub,
+            token_checker=token_checker,
+            error_handler=error_handler
+        )
+
+        self.app = None
+        self.blue_print = None
         self.service_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
-        self._init_service()
+        self._init_flask()
 
-    def _init_service(self):
-        """Registers Flask route handler for '/api' endpoint.
-        """
-        if flaskApp is not None:
-            @flaskApp.route('/api', methods=['POST'])
+    def _init_flask(self):
+        try:
+            from flask import Flask, request, Blueprint
+
+            self.app = Flask(__name__)
+            self.app.logger.setLevel(logging.ERROR)
+            self.blue_print = Blueprint(f'bp_{self.inst_name}', __name__)
+
+            @self.blue_print.route('/api', methods=['POST'])
             def webapi_entry():
                 try:
                     response = self.rpc_service.handle_flask_request(request)
@@ -240,9 +249,13 @@ class FlaskRPCServer:
                     print('/api Error', e)
                     print(traceback.format_exc())
                     response = ''
-                finally:
-                    pass
                 return response
+
+            self.app.register_blueprint(self.blue_print)
+        except Exception as e:
+            self.app = None
+            self.blue_print = None
+            print(f"Flask init fail: {str(e)}")
 
     # ------------------------------------------------------------------------------------------------------------------
 
@@ -252,11 +265,11 @@ class FlaskRPCServer:
         Args:
             debug: Enable Flask debug mode
         """
-        if flaskApp is not None:
+        if self.app is not None:
             print(f'Starting service: host = {self.listen_ip}, port = {self.listen_port}, debug = {debug}.')
 
             # https://stackoverflow.com/a/9476701/12929244
-            flaskApp.run(
+            self.app.run(
                 host=self.listen_ip,
                 port=self.listen_port,
                 debug=debug,

@@ -5,6 +5,15 @@
 import time
 import datetime
 import traceback
+
+if __name__ == '__main__':
+    import os
+    import sys
+
+    # For debug
+    root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.append(root_path)
+
 from ArbitraryRPC import RPCProxy, RPCService, FlaskRPCServer
 
 
@@ -79,28 +88,52 @@ class ServiceProvider:
 SERVICE_TOKEN = 'SleepySoft'
 
 
-def launch_service():
+def build_repeater_service(
+        repeater_name: str,
+        listen_ip: str,
+        listen_port: int,
+        downstream_host: str,
+        downstream_port: int):
+
+    repeater_proxy = RPCProxy(
+        api_url = f'http://{downstream_host}:{downstream_port}/api',
+        timeout = 10,        # If you want to debug, make this timeout longer.
+        token = SERVICE_TOKEN
+    )
+
+    repeater_server = FlaskRPCServer(
+        inst_name = repeater_name,
+        listen_ip = listen_ip,
+        listen_port = listen_port,
+
+        rpc_stub=repeater_proxy,
+        token_checker=None,
+        error_handler=None
+    )
+
+    return repeater_server
+
+
+def launch_service(listen_ip: str, listen_port: int):
     service_provider = ServiceProvider()
 
-    rpc_service = RPCService(
+    rpc_server = FlaskRPCServer(
+        inst_name = 'Main',
+        listen_ip = listen_ip,
+        listen_port = listen_port,
+
         rpc_stub=service_provider,
         token_checker=service_provider.check_token,
         error_handler=service_provider.handle_error
     )
 
-    rpc_server = FlaskRPCServer(
-        listen_ip = '0.0.0.0',
-        listen_port = 10800,
-        rpc_service = rpc_service
-    )
-
     rpc_server.run_service_in_thread()
 
 
-def launch_client():
+def launch_client(host: str, port: int):
     rpc_proxy = RPCProxy(
-        api_url = 'http://localhost:10800/api',
-        timeout = 5,        # If you want to debug, make this timeout longer.
+        api_url = f'http://{host}:{port}/api',
+        timeout = 10,        # If you want to debug, make this timeout longer.
         token = SERVICE_TOKEN
     )
 
@@ -108,15 +141,15 @@ def launch_client():
     result = rpc_proxy.ping()
     print('<= ' + str(result))
 
-    print(f'=> ping()')
-    result = rpc_proxy.echo("Hello from client and echo back.")
+    print(f"=> echo('Hello from client and echo back.')")
+    result = rpc_proxy.echo('Hello from client and echo back.')
     print('<= ' + str(result))
 
-    print(f'=> ping()')
+    print(f'=> add(1, 2)')
     result = rpc_proxy.add(1, 2)
     print('<= ' + str(result))
 
-    print(f'=> add()')
+    print(f"=> add('Sleepy', 'Soft')")
     result = rpc_proxy.add('Sleepy', 'Soft')
     print('<= ' + str(result))
 
@@ -142,8 +175,16 @@ def launch_client():
 
 
 def main():
-    launch_service()
-    launch_client()
+    launch_service('0.0.0.0', 10800)
+
+    repeater1 = build_repeater_service('repeater1', '0.0.0.0', 10700, 'localhost', 10800)
+    repeater2 = build_repeater_service('repeater2', '0.0.0.0', 10600, 'localhost', 10700)
+    repeater1.run_service_in_thread()
+    repeater2.run_service_in_thread()
+
+    launch_client('localhost', 10600)
+
+    # client -> repeater2 -> repeater1 -> server
 
 
 if __name__ == '__main__':
