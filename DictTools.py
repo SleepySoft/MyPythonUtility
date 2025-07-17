@@ -18,6 +18,74 @@ logger.setLevel(logging.INFO)
 
 
 def check_sanitize_dict(data: dict, verifier: BaseModel) -> Tuple[dict, str]:
+    """
+    Validates and sanitizes input dictionary using a Pydantic BaseModel schema.
+
+    This function performs type conversion, data validation, and automatic cleanup
+    via Pydantic's model_validate(). On success, returns the sanitized dict with
+    excluded fields. On failure, returns structured error messages locating field-level issues.
+
+    Key mechanisms:
+    1. **Validation & Sanitization**:
+       - Uses `verifier.model_validate(data)` for type coercion and validation.
+       - Applies `model_dump(exclude_unset=True, exclude_none=True)` to:
+         • Remove unset fields (exclude_unset)
+         • Exclude None-valued fields (exclude_none)
+    2. **Error Handling**:
+       - Aggregates multiple validation errors into a single string.
+       - Formats field paths using dot notation for nested errors (e.g., "user.address.zipcode").
+       - Logs detailed errors via `logger.error`.
+
+    Args:
+        data (dict): Raw input dictionary to validate.
+        verifier (BaseModel): Pydantic model defining data schema and constraints.
+
+    Returns:
+        Tuple[dict, str]:
+          - On success: (sanitized_dict, empty string)
+          - On failure: (empty dict, semicolon-delimited error messages)
+
+    Raises:
+        N/A (All exceptions are caught and returned as strings)
+
+    Example usage:
+    ```python
+    from pydantic import BaseModel
+
+    class UserSchema(BaseModel):
+        name: str
+        age: int
+        email: str
+
+    # Case 1: Valid input
+    data = {"name": "Alice", "age": 30, "email": "alice@example.com"}
+    result, err = check_sanitize_dict(data, UserSchema)
+    print(result)  # Output: {'name': 'Alice', 'age': 30, 'email': 'alice@example.com'}
+
+    # Case 2: Invalid input (type error)
+    bad_data = {"name": "Bob", "age": "thirty", "email": "invalid"}
+    result, err = check_sanitize_dict(bad_data, UserSchema)
+    print(err)  # Output: "Field [age]: Input should be a valid integer...; Field [email]: value is not a valid email address..."
+
+    # Case 3: Nested model validation
+    class Address(BaseModel):
+        city: str
+        zipcode: int
+
+    class Company(BaseModel):
+        name: str
+        address: Address
+
+    data = {"name": "TechCo", "address": {"city": "Paris", "zipcode": "75000"}}
+    result, err = check_sanitize_dict(data, Company)
+    print(result)  # Output: {'name': 'TechCo', 'address': {'city': 'Paris', 'zipcode': 75000}}
+    ```
+
+    Notes:
+    - Error format: `Field [path]: Error message (Type error: error_type)`
+    - Unset/None fields are stripped from the output dict on success.
+    - All errors are logged via `logger.error` before returning.
+    """
     try:
         validated_data = verifier.model_validate(data).model_dump(exclude_unset=True, exclude_none=True)
         return validated_data, ''
@@ -38,6 +106,8 @@ def check_sanitize_dict(data: dict, verifier: BaseModel) -> Tuple[dict, str]:
         return {}, str(e)
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+
 class DictPrinter:
     @classmethod
     def pretty_print(
@@ -50,13 +120,14 @@ class DictPrinter:
         current_depth: int = 0
     ) -> str:
         """
-        优雅打印字典结构
-
-        参数：
-        - indent: 缩进空格数 (默认2)
-        - sort_keys: 是否按键名排序 (默认False)
-        - colorize: 是否启用颜色 (自动检测终端支持)
-        - max_depth: 最大嵌套深度 (默认5层)
+        Use this function to print dictionary structure elegantly
+        :param data: The dict to be printed.
+        :param indent: number of spaces for indentation (default 2).
+        :param sort_keys: sort_keys: whether to sort by key name (default False)
+        :param colorize: colorize: whether to enable color (automatically detect terminal support).
+        :param max_depth: maximum nesting depth (default 5 layers)
+        :param current_depth: Parameters for recursive calls. Set to 0 when called by the user, or use the default value.
+        :return: Formated dict output text.
         """
         if colorize is None:
             colorize = HAS_COLORAMA and sys.stdout.isatty()
