@@ -2,17 +2,14 @@
 
 """
 
+import os
+import sys
 import time
 import datetime
 import traceback
 
-if __name__ == '__main__':
-    import os
-    import sys
-
-    # For debug
-    root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.append(root_path)
+root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(root_path)
 
 from ArbitraryRPC import RPCProxy, RPCService, FlaskRPCServer
 
