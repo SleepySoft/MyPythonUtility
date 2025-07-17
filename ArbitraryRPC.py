@@ -1,5 +1,7 @@
 """JSON-based RPC framework for remote procedure calls over HTTP with Flask backend."""
 
+import os
+import sys
 import json
 import logging
 import requests
@@ -7,6 +9,10 @@ import threading
 import traceback
 from functools import partial
 from typing import Optional, Callable
+
+root_path = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(root_path)
+
 from JsonSerializer import serialize, deserialize
 
 

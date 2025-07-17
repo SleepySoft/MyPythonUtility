@@ -1,5 +1,10 @@
+import os
+import sys
 import datetime
 import pandas as pd
+
+root_path = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(root_path)
 
 from JsonSerializer import *
 
