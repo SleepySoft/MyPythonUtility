@@ -84,5 +84,16 @@ I found some similar components in my different projects. I made them into utili
 >
 > More details can be found in the source file.
 
+-----------------------------------------------------------------------------
 
+## History manager
+
+### File
+> [HistoryManager.py](HistoryManager.py)
+
+### Description
+> A simple class to manages navigation history with forward/backward traversal, recording, and item removal.
+> Test and example: [history_manager_test.py](history_manager_test%2Fhistory_manager_test.py)
+>
+> More details can be found in the source file.
 
