@@ -34,33 +34,56 @@ class HistoryManager:
         manager.remove_trace("Page1")  # Removes all "Page1" entries
     """
     def __init__(self, max_size: int = 1000):
-        self.max_size = max(max_size, 1)
+        self.__max_size = max(max_size, 1)
+        self.__browse_trace = []
+        self.__current_index = -1
+
+    def set_capacity(self, max_size):
+        self.__max_size = max(max_size, 1)
+
+    def clear_trace(self):
         self.__browse_trace = []
         self.__current_index = -1
 
     def back_trace(self) -> any or None:
-        if not self.__browse_trace:
-            return None
         if self.__current_index > 0:
             self.__current_index -= 1
             return self.__browse_trace[self.__current_index]
         return None
 
     def forward_trace(self) -> any or None:
-        if not self.__browse_trace:
-            return None
         if self.__current_index < len(self.__browse_trace) - 1:
             self.__current_index += 1
             return self.__browse_trace[self.__current_index]
         return None
 
     def record_trace(self, item: any):
-        # 容量检查
-        while self.__current_index >= self.max_size - 1:
+        # Use current_index instead of len(browse_trace) avoiding
+        #   deletion by mistake when current_index is not pointing to the tail.
+        #
+        # Exp: browse_trace = [A, B, C], max_size = 3, current_index = 1.
+        #      When you adding D, judging len(browse_trace) >= max_size may cause wrong result [B, D]
+        #      But the correct result should be [A, B, D]
+        #
+        #　You can use record_trace(None) to trigger deletion after you changing the max_size by set_capacity()
+        #
+        while self.__current_index >= self.__max_size - 1:
             self.__browse_trace.pop(0)
             self.__current_index -= 1
+            
+        if not item:
+            return
 
-        # 追加新记录
+        # Optimise:
+        #   If the adding item is right the current item. Ignore.
+        #   If the adding item is right the next item. Just forward.
+        if self.__current_index >= 0:
+            if self.__browse_trace[self.__current_index] == item:
+                return
+            elif self.__current_index + 1 < len(self.__browse_trace) and \
+                    self.__browse_trace[self.__current_index + 1] == item:
+                self.__current_index += 1
+
         self.__browse_trace = self.__browse_trace[:self.__current_index + 1]
         self.__browse_trace.append(item)
         self.__current_index = len(self.__browse_trace) - 1

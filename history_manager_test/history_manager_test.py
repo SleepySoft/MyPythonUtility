@@ -115,7 +115,7 @@ class TestHistoryManager(unittest.TestCase):
         self.assertEqual(self.history._HistoryManager__browse_trace, ["B"])
         self.assertEqual(self.history._HistoryManager__current_index, 0)
 
-        self.history.max_size = 100
+        self.history.set_capacity(100)
 
         # 连续删除后回退
         for i in range(5):
