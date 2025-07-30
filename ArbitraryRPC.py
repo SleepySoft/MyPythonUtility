@@ -35,7 +35,7 @@ def requests_sender(url: str, payload: dict, headers: dict, timeout: int) -> str
     raise ValueError('No request lib.')
 
 
-def webservice_sender(ws, payload: dict, headers: dict, timeout: int) -> str:
+def web_socket_sender(ws, payload: dict, headers: dict, timeout: int) -> str:
     try:
         if ws.closed:
             return ''
@@ -45,6 +45,8 @@ def webservice_sender(ws, payload: dict, headers: dict, timeout: int) -> str:
 
         response = ws.recv(timeout=timeout)
         return response
+    except ConnectionResetError:
+        return ''
     except TimeoutError as e:
         return serialize({f"WS timeout error: {str(e)}"})
     except Exception as e:
@@ -347,19 +349,21 @@ class FlaskRPCServer:
                         self.ws_connections[client_id] = FlaskRPCServer.WsClient(
                             client_id,
                             ws,
-                            RPCProxy(sender=partial(webservice_sender, ws))
+                            RPCProxy(sender=partial(web_socket_sender, ws))
                         )
 
                     while not ws.closed:
                         try:
-                            data = ws.receive(timeout=2)
+                            data = ws.receive(timeout=5)
                             if data is None:
-                                ws.ping()
+                                continue
+                            if isinstance(data, bytes) and data == b"PING":
+                                ws.send(b"PONG")
                                 continue
                             response = self.rpc_service.handle_ws_request(data)
                             ws.send(response)
                         except TimeoutError:
-                            continue
+                            ws.ping()
                         except ConnectionError:
                             break
 
@@ -378,12 +382,8 @@ class FlaskRPCServer:
                         client = self.ws_connections.pop(client_id, None)
                         if client:
                             client.close()
-
-            self.app.register_blueprint(self.blue_print)
         except Exception as e:
-            self.app = None
-            self.blue_print = None
-            print(f"Flask init fail: {str(e)}")
+            print(f"Web socket init fail: {str(e)}")
 
     # ------------------------------------------------------------------------------------------------------------------
 
