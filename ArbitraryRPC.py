@@ -265,6 +265,7 @@ class FlaskRPCServer:
                  listen_ip: str,
                  listen_port: int,
                  rpc_stub: object,
+                 ws_support: bool = False,
                  token_checker: Callable[[str], bool] = None,
                  error_handler: Callable[[str], None] = None):
         """Configures RPC server instance.
@@ -277,6 +278,7 @@ class FlaskRPCServer:
         self.inst_name = inst_name
         self.listen_ip = listen_ip
         self.listen_port = listen_port
+        self.ws_support = ws_support
 
         self.rpc_service = RPCService(
             rpc_stub=rpc_stub,
@@ -291,6 +293,7 @@ class FlaskRPCServer:
         self.lock = threading.Lock()
         self.service_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+
         self._init_flask()
 
     def _init_flask(self):
@@ -301,7 +304,9 @@ class FlaskRPCServer:
             self.app.logger.setLevel(logging.ERROR)
 
             self._init_http(self.app)
-            self._init_websocket(self.app)
+
+            if self.ws_support:
+                self._init_websocket(self.app)
         except Exception as e:
             self.app = None
             print(f"Flask init fail: {str(e)}")
