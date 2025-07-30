@@ -1,0 +1,6 @@
+pydantic~=2.10.3
+colorama~=0.4.6
+requests~=2.32.3
+pandas~=1.4.4
+
+flask_sock

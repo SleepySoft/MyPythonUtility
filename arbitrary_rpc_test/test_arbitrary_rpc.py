@@ -7,11 +7,12 @@ import sys
 import time
 import datetime
 import traceback
+from functools import partial
 
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(root_path)
 
-from ArbitraryRPC import RPCProxy, RPCService, FlaskRPCServer
+from ArbitraryRPC import RPCProxy, RPCService, FlaskRPCServer, requests_sender
 
 
 class ServiceProvider:
@@ -93,7 +94,7 @@ def build_repeater_service(
         downstream_port: int):
 
     repeater_proxy = RPCProxy(
-        api_url = f'http://{downstream_host}:{downstream_port}/api',
+        sender=partial(requests_sender, f'http://{downstream_host}:{downstream_port}/api'),
         timeout = 10,        # If you want to debug, make this timeout longer.
         token = SERVICE_TOKEN
     )
@@ -129,7 +130,7 @@ def launch_service(listen_ip: str, listen_port: int):
 
 def launch_client(host: str, port: int):
     rpc_proxy = RPCProxy(
-        api_url = f'http://{host}:{port}/api',
+        sender=partial(requests_sender, f'http://{host}:{port}/api'),
         timeout = 10,        # If you want to debug, make this timeout longer.
         token = SERVICE_TOKEN
     )

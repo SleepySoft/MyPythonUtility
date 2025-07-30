@@ -4,11 +4,17 @@ import os
 import sys
 import json
 import logging
-import requests
 import threading
 import traceback
 from functools import partial
-from typing import Optional, Callable
+from typing import Optional, Callable, List
+
+from pydantic.dataclasses import dataclass
+
+try:
+    import requests
+except Exception as e:
+    requests = None
 
 root_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(root_path)
@@ -20,6 +26,30 @@ REQUEST_KEY_API = 'api'
 REQUEST_KEY_TOKEN = 'token'
 REQUEST_KEY_ARGS = 'args'
 REQUEST_KEY_KWARGS = 'kwargs'
+
+
+def requests_sender(url: str, payload: dict, headers: dict, timeout: int) -> str:
+    if requests:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        return resp.text if resp else ''
+    raise ValueError('No request lib.')
+
+
+def webservice_sender(ws, payload: dict, headers: dict, timeout: int) -> str:
+    try:
+        if ws.closed:
+            return ''
+
+        json_payload = serialize(payload)
+        ws.send(json_payload)
+
+        response = ws.recv(timeout=timeout)
+        return response
+    except TimeoutError as e:
+        return serialize({f"WS timeout error: {str(e)}"})
+    except Exception as e:
+        print(f"WS send error: {str(e)}")
+        return ''
 
 
 class RPCProxy:
@@ -37,15 +67,16 @@ class RPCProxy:
         timeout (int): Request timeout
         api_url (str): Server endpoint URL
     """
+
     def __init__(self,
-                 api_url: str = 'http://localhost:8000/api',
+                 sender: Callable[[dict, dict, int], str] = partial(requests_sender, 'http://localhost:8000/api'),
                  timeout: int = 0,
                  token: Optional[str] = None,
                  header: Optional[dict] = None):
         self.token = token or ''
+        self.sender = sender
         self.header = header or {}
         self.timeout = timeout or 0xFFFFFFFF
-        self.api_url = api_url
 
     # ------------------------------------------------------------------------------------
 
@@ -73,8 +104,7 @@ class RPCProxy:
         }
 
         try:
-            resp = requests.post(self.api_url, json=payload, headers=self.header, timeout=self.timeout)
-            resp_text = resp.text
+            resp_text = self.sender(payload, self.header, self.timeout)
             if not resp_text:
                 return None
             try:
@@ -118,7 +148,16 @@ class RPCService:
         self.token_checker = token_checker or (lambda _: True)
         self.error_handler = error_handler or (lambda error: print(error))
 
-    def handle_flask_request(self, flask_request):
+    def handle_ws_request(self, ws_request) -> str:
+        try:
+            req_data = json.loads(ws_request)
+            return self.handle_request_dict(req_data)
+        except json.JSONDecodeError:
+            return serialize({"error": "Invalid JSON"})
+        except Exception as e:
+            return serialize({"error": str(e)})
+
+    def handle_flask_request(self, flask_request) -> str:
         """Handles Flask request object directly.
 
         Args:
@@ -210,7 +249,19 @@ class RPCService:
 class FlaskRPCServer:
     """Flask-based HTTP server for hosting JSON-RPC services."""
 
-    def __init__(self, inst_name: str,
+    class WsClient:
+        def __init__(self, address: str, connection, reversed_proxy: RPCProxy):
+            self.address = address
+            self.connection = connection
+            self.reversed_proxy = reversed_proxy
+
+        def close(self):
+            if not self.connection.closed:
+                self.connection.close()
+            self.reversed_proxy = None
+
+    def __init__(self,
+                 inst_name: str,
                  listen_ip: str,
                  listen_port: int,
                  rpc_stub: object,
@@ -234,17 +285,31 @@ class FlaskRPCServer:
         )
 
         self.app = None
+        self.sock = None
         self.blue_print = None
+        self.ws_connections = {}
+        self.lock = threading.Lock()
         self.service_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self._init_flask()
 
     def _init_flask(self):
         try:
-            from flask import Flask, request, Blueprint
+            from flask import Flask
 
             self.app = Flask(__name__)
             self.app.logger.setLevel(logging.ERROR)
+
+            self._init_http(self.app)
+            self._init_websocket(self.app)
+        except Exception as e:
+            self.app = None
+            print(f"Flask init fail: {str(e)}")
+
+    def _init_http(self, flask_app):
+        try:
+            from flask import request, Blueprint
+
             self.blue_print = Blueprint(f'bp_{self.inst_name}', __name__)
 
             @self.blue_print.route('/api', methods=['POST'])
@@ -256,6 +321,58 @@ class FlaskRPCServer:
                     print(traceback.format_exc())
                     response = ''
                 return response
+
+            flask_app.register_blueprint(self.blue_print)
+        except Exception as e:
+            self.blue_print = None
+            print(f"Blue print init fail: {str(e)}")
+
+    def _init_websocket(self, flask_app):
+        try:
+            from flask_sock import Sock
+
+            self.sock = Sock(flask_app)
+
+            @self.sock.route('/reverse-rpc')
+            def handle_reverse_connection(ws):
+                client_id = f"{ws.remote_addr}:{id(ws)}"
+
+                try:
+                    with self.lock:
+                        self.ws_connections[client_id] = FlaskRPCServer.WsClient(
+                            client_id,
+                            ws,
+                            RPCProxy(sender=partial(webservice_sender, ws))
+                        )
+
+                    while not ws.closed:
+                        try:
+                            data = ws.receive(timeout=2)
+                            if data is None:
+                                ws.ping()
+                                continue
+                            response = self.rpc_service.handle_ws_request(data)
+                            ws.send(response)
+                        except TimeoutError:
+                            continue
+                        except ConnectionError:
+                            break
+
+                except Exception as e:
+                    error_txt = f"Server error: {str(e)}"
+                    error_msg = serialize({"error": error_txt})
+
+                    try:
+                        ws.send(error_msg)
+                    except:
+                        pass
+
+                    print(error_txt)
+                finally:
+                    with self.lock:
+                        client = self.ws_connections.pop(client_id, None)
+                        if client:
+                            client.close()
 
             self.app.register_blueprint(self.blue_print)
         except Exception as e:
@@ -335,6 +452,14 @@ class FlaskRPCServer:
             True if service thread is active
         """
         return self.service_thread is not None and self.service_thread.is_alive()
+
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def get_ws_clients(self) -> List[str]:
+        return list(self.ws_connections.keys())
+
+    def get_ws_client_proxy(self, client_id):
+        return self.ws_connections.get(client_id, None)
 
     # ------------------------------------------------------------------------------------------------------------------
 
