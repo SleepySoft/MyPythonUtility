@@ -6,10 +6,12 @@ import json
 import logging
 import threading
 import traceback
+import uuid
+from enum import Enum
 from functools import partial
-from typing import Optional, Callable, List
 
-from pydantic.dataclasses import dataclass
+from pydantic import BaseModel, ValidationError
+from typing import Optional, Callable, List
 
 try:
     import requests
@@ -22,20 +24,50 @@ sys.path.append(root_path)
 from JsonSerializer import serialize, deserialize
 
 
-REQUEST_KEY_API = 'api'
-REQUEST_KEY_TOKEN = 'token'
-REQUEST_KEY_ARGS = 'args'
-REQUEST_KEY_KWARGS = 'kwargs'
+# Use json wrapper for easier data transfer.
+DEFAULT_JSON_WRAPPER = 'ArbitraryRPC'
 
 
-def requests_sender(url: str, payload: dict, headers: dict, timeout: int) -> str:
+RPC_KEY_ENTRY = 'entry'
+RPC_KEY_TOKEN = 'token'
+RPC_KEY_SESSION = 'session'
+RPC_KEY_MSG_TYPE = 'msg_type'
+RPC_KEY_MSG_PAYLOAD = 'msg_payload'
+
+RPC_PAYLOAD_KEY_ARGS = 'args'
+RPC_PAYLOAD_KEY_KWARGS = 'kwargs'
+RPC_PAYLOAD_KEY_RAWDATA = 'rawdata'
+
+
+class MsgTypeEnum(str, Enum):
+    NA = ''
+    ACK = 'ack'
+    REQUEST = 'req'
+    RESPONSE = 'rep'
+
+
+class RpcPayload(BaseModel):
+    args: list | None = None
+    kwargs: dict | None = None
+    rawdata: object | None = None
+
+
+class RpcMessage(BaseModel):
+    entry: str
+    token: str | None = ''
+    session: str | None = ''
+    msg_type: MsgTypeEnum = MsgTypeEnum.NA
+    msg_payload: RpcPayload | None
+
+
+def requests_sender(url: str, payload: str, headers: dict, timeout: int) -> str:
     if requests:
-        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        resp = requests.post(url, json={DEFAULT_JSON_WRAPPER: payload}, headers=headers, timeout=timeout)
         return resp.text if resp else ''
     raise ValueError('No request lib.')
 
 
-def web_socket_sender(ws, payload: dict, headers: dict, timeout: int) -> str:
+def web_socket_sender(ws, payload: str, headers: dict, timeout: int) -> str:
     try:
         if ws.closed:
             return ''
@@ -71,7 +103,7 @@ class RPCProxy:
     """
 
     def __init__(self,
-                 sender: Callable[[dict, dict, int], str] = partial(requests_sender, 'http://localhost:8000/api'),
+                 sender: Callable[[str, dict, int], str] = partial(requests_sender, 'http://localhost:8000/api'),
                  timeout: int = 0,
                  token: Optional[str] = None,
                  header: Optional[dict] = None):
@@ -99,27 +131,57 @@ class RPCProxy:
             Deserialized response from server or raw text if deserialization fails
         """
         payload = {
-            REQUEST_KEY_API: api,
-            REQUEST_KEY_TOKEN: self.token,
-            REQUEST_KEY_ARGS: serialize(args),
-            REQUEST_KEY_KWARGS: serialize(kwargs),
+            RPC_KEY_ENTRY: api,
+            RPC_KEY_TOKEN: self.token,
+            RPC_KEY_SESSION: str(uuid.uuid4()),
+            RPC_KEY_MSG_TYPE: MsgTypeEnum.REQUEST,
+
+            RPC_KEY_MSG_PAYLOAD: RpcPayload(
+                args = args,
+                kwargs = kwargs
+            ).model_dump()
         }
 
         try:
-            resp_text = self.sender(payload, self.header, self.timeout)
+            payload_serialized = serialize(payload)
+
+            resp_text = self.sender(payload_serialized, self.header, self.timeout)
             if not resp_text:
                 return None
+
             try:
-                return deserialize(resp_text)
+                resp_data = deserialize(resp_text)
+                if not self.verify_sync_response(payload, resp_data):
+                    return ''
+                return resp_data.get(RPC_KEY_MSG_PAYLOAD, {}).get(RPC_PAYLOAD_KEY_RAWDATA, '')
             except Exception as e:
                 print(f'Cannot parse RPC result to json: {str(e)}')
                 # print(traceback.format_exc())
                 return resp_text
+
         except Exception as e:
             print(f'Parse RPC result fail: {str(e)}')
             # print(traceback.format_exc())
+            return ''
         finally:
             pass
+
+    @staticmethod
+    def verify_sync_response(original_data: dict, response_data: dict) -> bool:
+        try:
+            validated_data = RpcMessage.model_validate(response_data).model_dump()
+            if validated_data[RPC_KEY_MSG_TYPE] not in [MsgTypeEnum.NA, MsgTypeEnum.ACK, MsgTypeEnum.RESPONSE]:
+                return False
+            if validated_data[RPC_KEY_ENTRY] and validated_data[RPC_KEY_ENTRY] != original_data[RPC_KEY_ENTRY]:
+                return False
+            if validated_data[RPC_KEY_SESSION] and validated_data[RPC_KEY_SESSION] != original_data[RPC_KEY_SESSION]:
+                return False
+            return True
+        except ValidationError:
+            return False
+        except Exception as e:
+            print(f'RPC Response check fail: {str(e)}')
+            return False
 
 
 class RPCService:
@@ -152,12 +214,14 @@ class RPCService:
 
     def handle_ws_request(self, ws_request) -> str:
         try:
-            req_data = json.loads(ws_request)
-            return self.handle_request_dict(req_data)
+            req_dict = json.loads(ws_request)
+            rpc_data = req_dict[DEFAULT_JSON_WRAPPER]
+            rpc_result = self.handle_request_text(rpc_data)
+            return rpc_result
         except json.JSONDecodeError:
-            return serialize({"error": "Invalid JSON"})
+            return {"error": "Invalid JSON"}
         except Exception as e:
-            return serialize({"error": str(e)})
+            return {"error": str(e)}
 
     def handle_flask_request(self, flask_request) -> str:
         """Handles Flask request object directly.
@@ -173,41 +237,61 @@ class RPCService:
 
         req_data = flask_request.data
         req_dict = json.loads(req_data)
+        rpc_data = req_dict[DEFAULT_JSON_WRAPPER]
+        rpc_result = self.handle_request_text(rpc_data)
 
-        return self.handle_request_dict(req_dict)
+        return rpc_result
 
-    def handle_request_dict(self, req_data: dict) -> str:
+    def handle_request_text(self, rpc_data: str) -> str:
         """Processes request data in dictionary format.
 
         Args:
-            req_data: Deserialized JSON-RPC request
+            rpc_data: RPC serialized string.
 
         Returns:
             Serialized response data
         """
-        api = req_data.get(REQUEST_KEY_API, '')
-        token = req_data.get(REQUEST_KEY_TOKEN, '')
-        args_json = req_data.get(REQUEST_KEY_ARGS, '')
-        kwargs_json = req_data.get(REQUEST_KEY_KWARGS, '')
 
-        if RPCService.check_request(api, token, args_json, kwargs_json):
-            success, args, kwargs = RPCService.parse_request(args_json, kwargs_json)
-            resp_serialized = self.dispatch_request(api, token, *args, **kwargs)
-            return resp_serialized
-        return ''
+        try:
+            req_data = deserialize(rpc_data)
+            validated_data = RpcMessage.model_validate(req_data).model_dump(exclude_unset=False, exclude_none=False)
+
+            msg_type = validated_data.get(RPC_KEY_MSG_TYPE, '')
+            if msg_type not in [MsgTypeEnum.NA, MsgTypeEnum.REQUEST]:
+                raise TypeError('Not a request message.')
+
+            api = validated_data.get(RPC_KEY_ENTRY, '')
+            token = validated_data.get(RPC_KEY_TOKEN, '')
+            session = validated_data.get(RPC_KEY_SESSION, '')
+            payload = validated_data.get(RPC_KEY_MSG_PAYLOAD, { })
+
+            # args_json = payload.get(RPC_PAYLOAD_KEY_ARGS, '')
+            # kwargs_json = payload.get(RPC_PAYLOAD_KEY_KWARGS, '')
+            #
+            # success, args, kwargs = self.parse_request(args_json, kwargs_json)
+
+            args = payload.get(RPC_PAYLOAD_KEY_ARGS, [])
+            kwargs = payload.get(RPC_PAYLOAD_KEY_KWARGS, {})
+            result = self.dispatch_request(api, token, *args, **kwargs)
+
+            response = RpcMessage(
+                entry=api,
+                token='',
+                session=session,
+                msg_type=MsgTypeEnum.RESPONSE,
+                msg_payload=RpcPayload(
+                    rawdata=result
+                )
+            ).model_dump()
+
+            return serialize(response)
+
+        except ValidationError:
+            return ''
+        except Exception as e:
+            return ''
 
     # ----------------------------------------------------------------------------
-
-    @staticmethod
-    def check_request(api: str, token: str, args_json: str, kwargs_json: str) -> bool:
-        """Validates basic request parameters format.
-
-        Returns:
-            True if all parameters meet type requirements
-        """
-        return isinstance(api, str) and api != '' and \
-               isinstance(token, str) and token != '' and \
-               isinstance(args_json, str) and isinstance(kwargs_json, str)
 
     @staticmethod
     def parse_request(args_json: str, kwargs_json: str) -> (bool, list, dict):
