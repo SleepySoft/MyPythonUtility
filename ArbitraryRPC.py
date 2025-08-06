@@ -56,21 +56,19 @@ class RpcMessage(BaseModel):
     msg_payload: RpcPayload | None
 
 
-def requests_sender(url: str, payload: str, headers: dict, timeout: int) -> str:
+def requests_sender(url: str, serialized_json: str, headers: dict, timeout: int) -> str:
+    json_header = {"Content-Type": "application/json"}
     if requests:
-        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        resp = requests.post(url, data=serialized_json, headers={ **headers, **json_header }, timeout=timeout)
         return resp.text if resp else ''
     raise ValueError('No request lib.')
 
 
-def web_socket_sender(ws, payload: str, headers: dict, timeout: int) -> str:
+def web_socket_sender(ws, serialized_json: str, headers: dict, timeout: int) -> str:
     try:
         if ws.closed:
             return ''
-
-        json_payload = serialize(payload)
-        ws.send(json_payload)
-
+        ws.send(serialized_json)
         response = ws.recv(timeout=timeout)
         return response
     except ConnectionResetError:
@@ -230,8 +228,10 @@ class RPCService:
         from flask import request
         flask_request: request
 
-        req_data = flask_request.data
-        req_text= json.loads(req_data)
+        raw_data = request.get_data()
+        req_text = raw_data.decode('utf-8')
+        # req_data = flask_request.data
+        # req_text= json.loads(req_data)
         response = self.handle_request_text(req_text)
 
         return response
