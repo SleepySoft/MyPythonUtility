@@ -2,7 +2,7 @@ import sys
 import json
 import logging
 import datetime
-from typing import Any, Tuple, Dict, Optional
+from typing import Any, Tuple, Dict, Optional, List
 from pydantic import BaseModel, ValidationError
 
 try:
@@ -258,3 +258,21 @@ class DictPrinter:
         else:
             type_name = value.__class__.__name__
             return cls._color_wrap(f"<{type_name} object>", 'type', colorize)
+
+
+def dict_list_to_markdown(data_list: List[Dict]):
+    if not data_list:
+        return ""
+
+    headers = list(data_list[0].keys())
+    header_row = "| " + " | ".join(headers) + " |"
+    separator_row = "| " + " | ".join(["---"] * len(headers)) + " |"
+
+    data_rows = []
+    for item in data_list:
+        row_values = [str(item.get(header, "")) if item.get(header) is not None else "" for header in headers]
+        data_row = "| " + " | ".join(row_values) + " |"
+        data_rows.append(data_row)
+    markdown_table = "\n".join([header_row, separator_row] + data_rows)
+
+    return markdown_table
