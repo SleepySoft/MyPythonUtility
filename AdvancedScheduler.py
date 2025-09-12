@@ -15,6 +15,7 @@ import logging
 from logging import Logger
 from functools import wraps
 
+
 def _thread_wrapper(func: Callable[..., Any], task_id: str, logger: Logger, *args, **kwargs) -> None:
     """
     A wrapper function that executes the target function in a new daemon thread.
@@ -38,6 +39,7 @@ def _thread_wrapper(func: Callable[..., Any], task_id: str, logger: Logger, *arg
     thread.daemon = True  # Daemon thread will exit if main program exits
     thread.start()
     logger.info(f"Task '{task_id}' started in a new thread (ID: {thread.ident}).")
+
 
 class AdvancedScheduler:
     """
@@ -71,9 +73,9 @@ class AdvancedScheduler:
         }
 
         job_defaults = {
-            'coalesce': False,  # 是否合并多次错过的执行
-            'max_instances': 3,  # 允许的并发实例数
-            'misfire_grace_time': 30  # 允许的误执行时间
+            'coalesce': False,          # 是否合并多次错过的执行
+            'max_instances': 3,         # 允许的并发实例数
+            'misfire_grace_time': 30    # 允许的误执行时间
         }
 
         # Create scheduler instance
