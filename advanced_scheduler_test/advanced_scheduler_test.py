@@ -4,6 +4,7 @@ import unittest
 import time
 import threading
 from datetime import datetime, timedelta
+from functools import partial
 from unittest.mock import Mock, patch
 import logging
 
@@ -14,6 +15,15 @@ from AdvancedScheduler import AdvancedScheduler  # Import your actual class
 
 # Configure logging for tests
 logging.basicConfig(level=logging.WARNING)  # Reduce logging noise during tests
+
+
+mock_count = 0
+
+
+def mock_function_counter():
+    print('Execute mock function.')
+    global mock_count
+    mock_count += 1
 
 
 class TestAdvancedScheduler(unittest.TestCase):
@@ -28,6 +38,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         self.test_counter = 0
         self.execution_events = []
         self.mock_function = Mock()
+        self.scheduler.start_scheduler()
 
     def tearDown(self):
         """Clean up after each test - shutdown scheduler and reset state."""
@@ -45,12 +56,13 @@ class TestAdvancedScheduler(unittest.TestCase):
         """Test scheduler initialization and proper shutdown."""
         # Test initialization with different configurations
         bg_scheduler = AdvancedScheduler(use_background_scheduler=True)
+        bg_scheduler.start_scheduler()
         self.assertTrue(bg_scheduler.scheduler.running)
         bg_scheduler.shutdown()
 
-        blocking_scheduler = AdvancedScheduler(use_background_scheduler=False)
-        self.assertTrue(blocking_scheduler.scheduler.running)
-        blocking_scheduler.shutdown()
+        # blocking_scheduler = AdvancedScheduler(use_background_scheduler=False)
+        # self.assertTrue(blocking_scheduler.scheduler.running)
+        # blocking_scheduler.shutdown()
 
     def test_02_interval_task_basic(self):
         """Test basic interval task functionality."""
@@ -149,24 +161,45 @@ class TestAdvancedScheduler(unittest.TestCase):
 
         self.assertEqual(job_id, task_id)
 
+    def test_08_manual_task_execution_without_reset(self):
+        """Test manual task execution with delay."""
+        task_id = "manual_test"
+        global mock_count
+
+        self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
+
+        # Test immediate execution
+        self.scheduler.execute_task(task_id, delay_seconds=0)
+        # self.assertGreaterEqual(self.mock_function.call_count, 1)
+        self.assertGreaterEqual(mock_count, 1)
+
+        # Test delayed execution
+        self.scheduler.execute_task(task_id, delay_seconds=1)
+        time.sleep(2)
+        # self.assertGreaterEqual(self.mock_function.call_count, 2)
+        self.assertGreaterEqual(mock_count, 2)
+
+        time.sleep(1)
+        # self.assertGreaterEqual(self.mock_function.call_count, 3)
+        self.assertGreaterEqual(mock_count, 3)
+
     def test_08_manual_task_execution(self):
         """Test manual task execution with delay."""
         task_id = "manual_test"
 
+        self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
+
         # Test immediate execution
-        immediate_id = self.scheduler.execute_task(
-            self.mock_function, task_id, delay_seconds=0
-        )
+        self.scheduler.execute_task(task_id, delay_seconds=0)
+        self.assertGreaterEqual(self.mock_function.call_count, 2)
 
         # Test delayed execution
-        delayed_id = self.scheduler.execute_task(
-            self.mock_function, f"{task_id}_delayed", delay_seconds=1
-        )
-
+        self.scheduler.execute_task(task_id, delay_seconds=1)
         time.sleep(1.5)
-
-        # Should be called at least twice (immediate + delayed)
         self.assertGreaterEqual(self.mock_function.call_count, 2)
+
+        time.sleep(1)
+        self.assertGreaterEqual(self.mock_function.call_count, 3)
 
     def test_09_task_timeout_management(self):
         """Test task timeout functionality."""

@@ -1,3 +1,4 @@
+import traceback
 from datetime import datetime, timedelta
 from typing import Callable, Any, Optional, Union, Dict, List
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -16,29 +17,54 @@ from logging import Logger
 from functools import wraps
 
 
-def _thread_wrapper(func: Callable[..., Any], task_id: str, logger: Logger, *args, **kwargs) -> None:
+class TaskWrapper:
     """
-    A wrapper function that executes the target function in a new daemon thread.
-    Also captures and logs any exceptions that occur in the thread.
+    A wrapper class for tasks, preserving execution context and enabling execution via thread pool.
+    Adds debug prints before and after task execution.
+    """
 
-    Args:
-        func: The target function to execute.
-        task_id: ID of the task for logging.
-        logger: Logger instance for logging.
-        *args: Positional arguments for the function.
-        **kwargs: Keyword arguments for the function.
-    """
-    def run() -> None:
+    def __init__(self, func: Callable[..., Any], task_id: str,
+                 logger: Logger, use_new_thread: bool, *args, **kwargs):
+        """
+        Initialize the TaskWrapper with execution context.
+
+        Args:
+            func: The target function to execute.
+            task_id: Unique identifier for the task, used for logging.
+            logger: Logger instance for logging messages.
+            use_new_thread: Flag indicating whether the task should run in a new thread.
+            *args: Positional arguments to pass to the function.
+            **kwargs: Keyword arguments to pass to the function.
+        """
+        self.func = func
+        self.task_id = task_id
+        self.logger = logger
+        self.use_new_thread = use_new_thread  # Save the threading preference
+        self.args = args
+        self.kwargs = kwargs
+        # Preserve the context when the task was created
+        self.creation_time = datetime.now()
+        self.creation_thread = threading.current_thread().name
+
+    def run(self) -> None:
+        """
+        Execute the task. This method is designed to be called by a thread pool.
+        Adds debug prints before and after execution.
+        """
+        # Debug print before execution
+        self.logger.debug(f"Task '{self.task_id}' starting execution. "
+                         f"Created at {self.creation_time} in thread '{self.creation_thread}', "
+                         f"executing in thread '{threading.current_thread().name}'. "
+                         f"Use_new_thread: {self.use_new_thread}")
+
         try:
-            func(*args, **kwargs)
-            logger.debug(f"Task '{task_id}' executed successfully in a new thread.")
+            # Execute the actual task function
+            self.func(*self.args, **self.kwargs)
+            # Debug print after successful execution
+            self.logger.debug(f"Task '{self.task_id}' executed successfully.")
         except Exception as e:
-            logger.error(f"Error in task '{task_id}' execution (threaded): {e}", exc_info=True)
-    # Create and start a daemon thread
-    thread = threading.Thread(target=run, name=f"TaskThread-{task_id}-{datetime.now().timestamp()}")
-    thread.daemon = True  # Daemon thread will exit if main program exits
-    thread.start()
-    logger.info(f"Task '{task_id}' started in a new thread (ID: {thread.ident}).")
+            # Log any exceptions that occur during execution
+            self.logger.error(f"Error in task '{self.task_id}' execution: {e}", exc_info=True)
 
 
 class AdvancedScheduler:
@@ -98,16 +124,17 @@ class AdvancedScheduler:
 
         # Dictionary to track task timeouts
         self.task_timeouts = {}
-        # Dictionary to track running tasks and their futures for timeout handling
-        self.running_tasks = {}
         self._running_tasks_lock = threading.RLock()  # Use RLock for potential nested locking
+        self.thread_pool = ConcurrentThreadPoolExecutor(
+            max_workers=default_thread_pool_size,
+            thread_name_prefix="AdvancedSchedulerThread")
 
         # Set up event listeners for job execution events
         self.scheduler.add_listener(self._job_listener,
                                     EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED)
 
         # Start the scheduler
-        self.scheduler.start()
+        # self.scheduler.start()
         self.logger.info("AdvancedScheduler initialized and started successfully")
 
     def _job_listener(self, event: JobExecutionEvent) -> None:
@@ -121,26 +148,19 @@ class AdvancedScheduler:
         elif event.code == EVENT_JOB_MISSED:
             self.logger.warning(f"Job {event.job_id} missed its scheduled run time.")
 
-    def _wrap_function_for_threading(self, func: Callable[..., Any], task_id: str, use_new_thread: bool) -> Callable[..., Any]:
+    def start_scheduler(self):
+        """Start the scheduler. Note that if using BlockingScheduler, this call will block."""
+        self.scheduler.start()
+        # If it is BlockingScheduler, the following log will be printed only after the scheduler ends.
+        self.logger.info("Scheduler started.")
+
+    def shutdown(self, wait: bool = True) -> None:
         """
-        Optionally wrap the function to execute in a new thread.
-
-        Args:
-            func: The original function to be executed.
-            task_id: The ID of the task.
-            use_new_thread: If True, wrap the function to run in a new thread.
-
-        Returns:
-            The wrapped function or the original function.
+        Shutdown the scheduler and all running tasks.
         """
-        if not use_new_thread:
-            return func  # Return the original function if no threading is requested.
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            """Wrapper that starts the function in a new thread and returns immediately."""
-            _thread_wrapper(func, task_id, self.logger, *args, **kwargs)
-        return wrapper
+        self.scheduler.shutdown(wait=wait)
+        self.thread_pool.shutdown(wait=wait)  # Add this line
+        self.logger.info("Scheduler shutdown completed")
 
     def add_interval_task(self, func: Callable[..., Any], interval_seconds: int,
                           task_id: str, args: list = None, kwargs: dict = None,
@@ -162,25 +182,34 @@ class AdvancedScheduler:
         """
         args = args or []
         kwargs = kwargs or {}
+
         trigger_args = {'seconds': interval_seconds}
         if not start_immediately:
             trigger_args['start_date'] = datetime.now() + timedelta(seconds=interval_seconds)
 
-        # Wrap the function if use_new_thread is True
-        wrapped_func = self._wrap_function_for_threading(func, task_id, use_new_thread)
-
-        job = self.scheduler.add_job(
-            wrapped_func,  # Use the potentially wrapped function
-            trigger='interval',
-            id=task_id,
-            args=args,
-            kwargs=kwargs,
-            **trigger_args
+        # Create TaskWrapper instance
+        task_wrapper = TaskWrapper(
+            func=func,
+            task_id=task_id,
+            logger=self.logger,
+            use_new_thread=use_new_thread,
+            *args,
+            **kwargs
         )
 
-        thread_info = " (in a new thread)" if use_new_thread else ""
-        self.logger.info(f"Interval task '{task_id}' added with {interval_seconds}s interval{thread_info}.")
-        return job.id
+        try:
+            job = self.scheduler.add_job(
+                task_wrapper.run,  # Use the run method of TaskWrapper
+                trigger='interval',
+                id=task_id,
+                **trigger_args
+            )
+            self.logger.info(f"Interval task '{task_id}' added with {interval_seconds}s interval. "
+                             f"Use new thread: {use_new_thread}")
+            return job.id
+        except Exception as e:
+            self.logger.error(f"Failed to add interval task '{task_id}': {e}")
+            raise
 
     def add_cron_task(self, func: Callable[..., Any], task_id: str,
                       year: str = None, month: str = None, day: str = None,
@@ -212,11 +241,18 @@ class AdvancedScheduler:
         args = args or []
         kwargs = kwargs or {}
 
-        # Wrap the function if use_new_thread is True
-        wrapped_func = self._wrap_function_for_threading(func, task_id, use_new_thread)
+        # Create TaskWrapper instance
+        task_wrapper = TaskWrapper(
+            func=func,
+            task_id=task_id,
+            logger=self.logger,
+            use_new_thread=use_new_thread,
+            *args,
+            **kwargs
+        )
 
         job = self.scheduler.add_job(
-            wrapped_func,  # Use the potentially wrapped function
+            task_wrapper.run,  # Use the run method of TaskWrapper
             trigger='cron',
             id=task_id,
             year=year,
@@ -226,13 +262,10 @@ class AdvancedScheduler:
             day_of_week=day_of_week,
             hour=hour,
             minute=minute,
-            second=second,
-            args=args,
-            kwargs=kwargs
+            second=second
         )
 
-        thread_info = " (in a new thread)" if use_new_thread else ""
-        self.logger.info(f"Cron task '{task_id}' added with custom schedule{thread_info}.")
+        self.logger.info(f"Cron task '{task_id}' added. Use new thread: {use_new_thread}")
         return job.id
 
     def add_daily_task(self, func: Callable[..., Any], task_id: str,
@@ -312,43 +345,162 @@ class AdvancedScheduler:
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def execute_task(self, func: Callable[..., Any], task_id: str,
-                     delay_seconds: int = 0, args: list = None,
-                     kwargs: dict = None, use_new_thread: bool = False) -> str:
+    def add_once_task(self, func: Callable[..., Any], task_id: str, delay_seconds: int = 0,
+                      args: list = None, kwargs: dict = None, use_new_thread: bool = False) -> str:
         """
-        Manually trigger a task execution with optional delay.
+        Adds a task that executes only once, either immediately or with a delay.
 
         Args:
-            func: Function to be executed
-            task_id: Unique identifier for the task
-            delay_seconds: Delay in seconds before execution (0 for immediate)
-            args: Positional arguments for the function
-            kwargs: Keyword arguments for the function
-            use_new_thread: If True, the task will be executed in a new daemon thread.
+            func: The function to be executed
+            task_id: The unique identifier of the task
+            delay_seconds: The number of seconds to delay execution. 0 indicates immediate execution
+            args: Positional arguments to the function
+            kwargs: Keyword arguments to the function
+            use_new_thread: Whether to execute the task in a new thread
 
         Returns:
-            Job ID of the created task
+            The ID of the task
         """
         args = args or []
         kwargs = kwargs or {}
-        run_date = datetime.now() + timedelta(seconds=delay_seconds)
-        # Generate a more unique ID for manual execution to avoid conflicts
-        unique_id = f"manual_{task_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        kwargs['_use_new_thread'] = use_new_thread  # Store threading preference
 
-        # Wrap the function if use_new_thread is True
-        wrapped_func = self._wrap_function_for_threading(func, task_id, use_new_thread)
+        try:
+            if delay_seconds > 0:
+                return self._schedule_delayed_task(
+                    func,
+                    task_id,
+                    delay_seconds,
+                    *args,
+                    **kwargs
+                )
+            else:
+                # Immediate execution using common method
+                self._execute_task_immediately(func, task_id, use_new_thread, *args, **kwargs)
+                return f"immediate_{task_id}"
+
+        except Exception as e:
+            self.logger.error(f"Add once task '{task_id}' failed: {e}")
+            raise
+
+    def execute_task(self, task_id: str, delay_seconds: int = 0, reset_timer: bool = False) -> bool:
+        """
+        Manually execute the specified task with optional delay and timer reset.
+
+        Args:
+            task_id: Unique identifier of the task to execute
+            delay_seconds: Delay in seconds before execution (0 for immediate)
+            reset_timer: If True, reset the timer for periodic tasks (IntervalTrigger or CronTrigger)
+
+        Returns:
+            True if the task is found and successfully executed/trigger reset,
+            False if the task is not found or operation fails.
+        """
+        job = self.scheduler.get_job(task_id)
+        if not job:
+            self.logger.error(f"Task '{task_id}' not found")
+            return False
+
+        try:
+            # Extract execution parameters from original job
+            job_args = list(job.args)
+            job_kwargs = job.kwargs.copy()
+
+            # Extract threading preference with default fallback
+            use_new_thread = job_kwargs.pop('_use_new_thread', False)
+
+            # Actual function is the first argument in our wrapper
+            original_func = job.func
+
+            if delay_seconds > 0:
+                # Schedule new delayed execution
+                self._schedule_delayed_task(
+                    original_func,
+                    task_id,
+                    delay_seconds,
+                    *job_args,
+                    **job_kwargs
+                )
+            else:
+                # Execute immediately
+                self._execute_task_immediately(
+                    original_func,
+                    task_id,
+                    use_new_thread,
+                    *job_args,
+                    **job_kwargs
+                )
+
+            # Handle periodic task reset
+            if reset_timer:
+                if isinstance(job.trigger, (IntervalTrigger, CronTrigger)):
+                    job.reschedule(trigger=job.trigger)
+                    self.logger.info(f"Reset timer for '{task_id}'. Next run: {job.next_run_time}")
+                else:
+                    self.logger.warning(f"Task '{task_id}' doesn't support timer reset")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Execute task '{task_id}' failed: {e}", exc_info=True)
+            return False
+
+    def _execute_task_immediately(self, func: Callable[..., Any], task_id: str,
+                                  use_new_thread: bool, *args, **kwargs) -> None:
+        """
+        Execute a task immediately in either current thread or new thread.
+
+        Args:
+            func: Function to execute
+            task_id: Task identifier for logging
+            use_new_thread: Whether to use new thread
+            args: Positional arguments for the function
+            kwargs: Keyword arguments for the function
+        """
+        if use_new_thread:
+            self.logger.info(f"Executing task '{task_id}' in new thread")
+            # Create TaskWrapper and submit to thread pool
+            task_wrapper = TaskWrapper(
+                func=func,
+                task_id=task_id,
+                logger=self.logger,
+                use_new_thread=use_new_thread,
+                *args,
+                **kwargs
+            )
+            self.thread_pool.submit(task_wrapper.run)
+        else:
+            self.logger.info(f"Executing task '{task_id}' in current thread")
+            func(*args, **kwargs)
+            self.logger.debug(f"Task '{task_id}' executed successfully")
+
+    def _schedule_delayed_task(self, func: Callable[..., Any], task_id: str,
+                               delay_seconds: int, *args, **kwargs) -> str:
+        """
+        Schedule a task with delay using unique task ID.
+
+        Args:
+            func: Function to schedule
+            task_id: Base task ID (will be extended with uniqueness)
+            delay_seconds: Delay duration in seconds
+            args: Positional arguments for the function
+            kwargs: Keyword arguments for the function
+
+        Returns:
+            Generated job ID
+        """
+        run_date = datetime.now() + timedelta(seconds=delay_seconds)
+        task_id = task_id or f"{task_id}_delay_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
         job = self.scheduler.add_job(
-            wrapped_func,  # Use the potentially wrapped function
+            func,
             trigger='date',
             run_date=run_date,
-            id=unique_id,
+            id=task_id,
             args=args,
             kwargs=kwargs
         )
-
-        thread_info = " (in a new thread)" if use_new_thread else ""
-        self.logger.info(f"Manual task '{task_id}' scheduled with {delay_seconds}s delay{thread_info} (Job ID: {unique_id}).")
+        self.logger.info(f"Scheduled task '{task_id}' with {delay_seconds}s delay (Job ID: {unique_id})")
         return job.id
 
     def reset_task_timer(self, task_id: str) -> bool:
@@ -427,16 +579,6 @@ class AdvancedScheduler:
             except Exception as e:
                 self.logger.error(f"Task {task_id} encountered an error: {e}")
                 raise
-
-    def shutdown(self, wait: bool = True) -> None:
-        """
-        Shutdown the scheduler and all running tasks.
-
-        Args:
-            wait: Whether to wait for running tasks to complete
-        """
-        self.scheduler.shutdown(wait=wait)
-        self.logger.info("Scheduler shutdown completed")
 
     def get_task_status(self, task_id: str) -> Optional[Dict]:
         """
