@@ -68,6 +68,8 @@ class TestAdvancedScheduler(unittest.TestCase):
         """Test basic interval task functionality."""
         task_id = "interval_test"
         interval_seconds = 1
+        wait_tolerance = 1.1
+        check_times = 5
 
         # Add interval task
         job_id = self.scheduler.add_interval_task(
@@ -76,11 +78,9 @@ class TestAdvancedScheduler(unittest.TestCase):
 
         self.assertEqual(job_id, task_id)
 
-        # Wait for potential execution
-        time.sleep(1.5)
-
-        # Check if task was executed at least once
-        self.mock_function.assert_called()
+        for i in range(check_times):
+            time.sleep(interval_seconds * wait_tolerance)
+            self.assertGreaterEqual(self.mock_function.call_count, i)
 
     def test_03_interval_task_with_args(self):
         """Test interval task with arguments."""
@@ -92,6 +92,8 @@ class TestAdvancedScheduler(unittest.TestCase):
             self.mock_function, 1, task_id,
             args=test_args, kwargs=test_kwargs
         )
+
+        self.assertEqual(job_id, task_id)
 
         time.sleep(1.1)
 
@@ -175,7 +177,7 @@ class TestAdvancedScheduler(unittest.TestCase):
 
         # Test delayed execution
         self.scheduler.execute_task(task_id, delay_seconds=1)
-        time.sleep(2)
+        time.sleep(1.5)
         # self.assertGreaterEqual(self.mock_function.call_count, 2)
         self.assertGreaterEqual(mock_count, 2)
 
