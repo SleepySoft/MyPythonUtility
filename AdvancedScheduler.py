@@ -22,6 +22,8 @@ from apscheduler.events import (
 )
 from concurrent.futures import ThreadPoolExecutor as ConcurrentThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
+from sympy.codegen.ast import Raise
+
 
 def get_system_timezone():
     tz = tzlocal.get_localzone()
@@ -193,8 +195,10 @@ class AdvancedScheduler:
         self.task_timeouts.clear()
         self.logger.info("Scheduler shutdown completed")
 
+    # ------------------------------------------------------------------------------------------------------------------
+
     def add_interval_task(self, func: Callable[..., Any], interval_seconds: int,
-                          task_id: str, args: tuple = None, kwargs: dict = None,
+                          task_id: str, replace: bool = False, args: tuple = None, kwargs: dict = None,
                           use_new_thread: bool = False, start_immediately: bool = True) -> str:
         """
         Add a periodic task that runs at fixed intervals.
@@ -203,6 +207,7 @@ class AdvancedScheduler:
             func: Function to be executed
             interval_seconds: Interval in seconds between executions
             task_id: Unique identifier for the task
+            replace: Replace if it has task with  same id
             args: Positional arguments for the function
             kwargs: Keyword arguments for the function
             use_new_thread: If True, the task will be executed in a new daemon thread.
@@ -211,6 +216,12 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
+        if not func:
+            raise ValueError('Invalid task function.')
+        if interval_seconds <= 0:
+            raise ValueError('Invalid task interval.')
+        self._check_handle_duplicated_task_id(task_id, replace)
+
         args = args or ()
         kwargs = kwargs or {}
 
@@ -243,7 +254,7 @@ class AdvancedScheduler:
             traceback.print_exc()
             raise
 
-    def add_cron_task(self, func: Callable[..., Any], task_id: str,
+    def add_cron_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
                       year: str = None, month: str = None, day: str = None,
                       week: str = None, day_of_week: str = None,
                       hour: str = None, minute: str = None, second: str = None,
@@ -255,6 +266,7 @@ class AdvancedScheduler:
         Args:
             func: Function to be executed
             task_id: Unique identifier for the task
+            replace: Replace if it has task with  same id
             year: Year expression (e.g., '2023', '2023-2025')
             month: Month expression (e.g., '1-12', '*/3')
             day: Day of month expression (e.g., '1,15,31')
@@ -270,6 +282,10 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
+        if not func:
+            raise ValueError('Invalid task function.')
+        self._check_handle_duplicated_task_id(task_id, replace)
+
         args = args or ()
         kwargs = kwargs or {}
 
@@ -300,7 +316,7 @@ class AdvancedScheduler:
         self.logger.info(f"Cron task '{task_id}' added. Use new thread: {use_new_thread}")
         return job.id
 
-    def add_daily_task(self, func: Callable[..., Any], task_id: str,
+    def add_daily_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
                        hour: int = 0, minute: int = 0, second: int = 0,
                        args: tuple = None, kwargs: dict = None,
                        use_new_thread: bool = False) -> str:
@@ -310,6 +326,7 @@ class AdvancedScheduler:
         Args:
             func: Function to be executed
             task_id: Unique identifier for the task
+            replace: Replace if it has task with  same id
             hour: Hour of day (0-23)
             minute: Minute of hour (0-59)
             second: Second of minute (0-59)
@@ -325,8 +342,8 @@ class AdvancedScheduler:
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def add_weekly_task(self, func: Callable[..., Any], task_id: str,
-                        day_of_week: str, hour: int = 0, minute: int = 0, second: int = 0,
+    def add_weekly_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
+                        day_of_week: str = 'mon', hour: int = 0, minute: int = 0, second: int = 0,
                         args: tuple = None, kwargs: dict = None,
                         use_new_thread: bool = False) -> str:
         """
@@ -335,6 +352,7 @@ class AdvancedScheduler:
         Args:
             func: Function to be executed
             task_id: Unique identifier for the task
+            replace: Replace if it has task with  same id
             day_of_week: Day of week ('mon', 'tue', etc. or '0-6')
             hour: Hour of day (0-23)
             minute: Minute of hour (0-59)
@@ -347,11 +365,12 @@ class AdvancedScheduler:
             Job ID of the created task
         """
         return self.add_cron_task(
-            func, task_id, day_of_week=day_of_week, hour=str(hour), minute=str(minute), second=str(second),
+            func, task_id, day_of_week=day_of_week, replace=replace,
+            hour=str(hour), minute=str(minute), second=str(second),
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def add_monthly_task(self, func: Callable[..., Any], task_id: str,
+    def add_monthly_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
                          day: int = 1, hour: int = 0, minute: int = 0, second: int = 0,
                          args: tuple = None, kwargs: dict = None,
                          use_new_thread: bool = False) -> str:
@@ -361,6 +380,7 @@ class AdvancedScheduler:
         Args:
             func: Function to be executed
             task_id: Unique identifier for the task
+            replace: Replace if it has task with  same id
             day: Day of month (1-31)
             hour: Hour of day (0-23)
             minute: Minute of hour (0-59)
@@ -373,11 +393,12 @@ class AdvancedScheduler:
             Job ID of the created task
         """
         return self.add_cron_task(
-            func, task_id, day=str(day), hour=str(hour), minute=str(minute), second=str(second),
+            func, task_id, replace=replace,
+            day=str(day), hour=str(hour), minute=str(minute), second=str(second),
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def add_once_task(self, func: Callable[..., Any], task_id: str, delay_seconds: int = 0,
+    def add_once_task(self, func: Callable[..., Any], task_id: str, replace: bool = False, delay_seconds: int = 0,
                       args: tuple = None, kwargs: dict = None, use_new_thread: bool = False) -> str:
         """
         Adds a task that executes only once, either immediately or with a delay.
@@ -385,6 +406,7 @@ class AdvancedScheduler:
         Args:
             func: The function to be executed
             task_id: The unique identifier of the task
+            replace: Replace if it has task with  same id
             delay_seconds: The number of seconds to delay execution. 0 indicates immediate execution
             args: Positional arguments to the function
             kwargs: Keyword arguments to the function
@@ -393,6 +415,9 @@ class AdvancedScheduler:
         Returns:
             The ID of the task
         """
+        if not func:
+            raise ValueError('Invalid task function.')
+        self._check_handle_duplicated_task_id(task_id, replace)
         return self._schedule_task_execution(
             func, task_id, delay_seconds, use_new_thread,
             *(args or ()), **(kwargs or {})
@@ -436,6 +461,8 @@ class AdvancedScheduler:
         except Exception as e:
             self.logger.error(f"Execute task '{task_id}' failed: {e}", exc_info=True)
             return False
+
+    # ------------------------------------------------------------------------------------------------------------------
 
     def delay_task(self, task_id: str, delay_seconds: int):
         job = self.scheduler.get_job(task_id)
@@ -570,6 +597,8 @@ class AdvancedScheduler:
             return True
         return False
 
+    # ------------------------------------------------------------------------------------------------------------------
+
     def _do_reset_task_timer(self, job) -> bool:
         if not job:
             self.logger.warning("Job not found")
@@ -579,11 +608,11 @@ class AdvancedScheduler:
             self.logger.warning(f"Job {job.id} is not an IntervalTrigger and cannot be reset in this way.")
             return False
 
-        # 记录重置前的状态
-        original_next_run = job.next_run_time
+        # # 记录重置前的状态
+        # original_next_run = job.next_run_time
         current_time = get_aware_time()
-        self.logger.info(
-            f"Before reset - Job '{job.id}': current_time={current_time}, original_next_run={original_next_run}")
+        # self.logger.info(
+        #     f"Before reset - Job '{job.id}': current_time={current_time}, original_next_run={original_next_run}")
 
         try:
             # 计算新的开始时间：当前时间 + 间隔
@@ -599,12 +628,12 @@ class AdvancedScheduler:
             self.scheduler.reschedule_job(job_id=job.id, trigger=new_trigger)
 
             # 重新获取job对象以获取更新后的next_run_time
-            updated_job = self.scheduler.get_job(job.id)
-            new_next_run = updated_job.next_run_time if updated_job else None
+            # updated_job = self.scheduler.get_job(job.id)
+            # new_next_run = updated_job.next_run_time if updated_job else None
 
-            self.logger.info(f"Timer for job '{job.id}' has been reset. "
-                             f"New start date: {new_start_date}. "
-                             f"Next run time: {new_next_run}")
+            # self.logger.info(f"Timer for job '{job.id}' has been reset. "
+            #                  f"New start date: {new_start_date}. "
+            #                  f"Next run time: {new_next_run}")
             return True
 
         except AttributeError as e:
@@ -699,6 +728,20 @@ class AdvancedScheduler:
             except Exception as e:
                 self.logger.error(f"Task {task_id} encountered an error: {e}")
                 raise
+
+    def _check_handle_duplicated_task_id(self, task_id: str, replace: bool):
+        existing_job = self.scheduler.get_job(task_id)
+        if existing_job:
+            if replace:
+                # Remove the existing job before adding new one
+                self.scheduler.remove_job(task_id)
+                self.logger.info(f"Replaced existing job with ID: {task_id}")
+            else:
+                # Raise exception for duplicate ID without replacement
+                raise ValueError(
+                    f"Job with ID '{task_id}' already exists. "
+                    f"Set replace=True to replace the existing job."
+                )
 
 
 # Example usage and demonstration

@@ -8,6 +8,8 @@ from functools import partial
 from unittest.mock import Mock, patch
 import logging
 
+from aiofiles.os import replace
+
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(root_path)
 
@@ -42,7 +44,7 @@ class TestAdvancedScheduler(unittest.TestCase):
 
     def tearDown(self):
         """Clean up after each test - shutdown scheduler and reset state."""
-        if hasattr(self, 'scheduler'):
+        if self.scheduler and hasattr(self, 'scheduler'):
             self.scheduler.shutdown(wait=False)
         self.mock_function.reset_mock()
         self.execution_events.clear()
@@ -248,7 +250,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         # Try to reset non-existent task
         self.assertFalse(self.scheduler.reset_task_timer("non_existent_task"))
 
-    def test_11_task_removal(self):
+    def test_12_task_removal(self):
         """Test task removal functionality."""
         task_id = "removal_test"
 
@@ -268,7 +270,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         # Try to remove non-existent task
         self.assertFalse(self.scheduler.remove_task("non_existent_task"))
 
-    def test_12_concurrent_task_execution(self):
+    def test_13_concurrent_task_execution(self):
         """Test concurrent task execution handling."""
         task_id = "concurrent_test"
         execution_count = [0]
@@ -290,32 +292,52 @@ class TestAdvancedScheduler(unittest.TestCase):
         # Should have multiple executions
         self.assertGreater(execution_count[0], 1)
 
-    def test_13_edge_case_duplicate_task_ids(self):
-        """Test behavior with duplicate task IDs."""
+    def test_14_edge_case_duplicate_task_ids(self):
+        """Test behavior with duplicate task IDs when replace=False and replace=True."""
         task_id = "duplicate_test"
 
-        # Add first task
-        job1 = self.scheduler.add_interval_task(
+        # Add first task with 2-second interval
+        job1_id = self.scheduler.add_interval_task(
             self.mock_function, 2, task_id
         )
 
-        # Try to add second task with same ID - should work but replace the first
-        job2 = self.scheduler.add_interval_task(
-            self.mock_function, 3, task_id
+        # Verify the first job was added and has correct interval
+        self.assertIsNotNone(job1_id)
+        initial_status = self.scheduler.get_task_status(task_id)
+        self.assertIsNotNone(initial_status)
+
+        # Test that adding duplicate ID without replace raises ValueError
+        with self.assertRaises(ValueError) as context:
+            self.scheduler.add_interval_task(
+                self.mock_function, 3, task_id, replace=False
+            )
+
+        # Verify the exception message is informative
+        self.assertIn("already exists", str(context.exception))
+        self.assertIn(task_id, str(context.exception))
+
+        # Test that adding with replace=True succeeds
+        job2_id = self.scheduler.add_interval_task(
+            self.mock_function, 3, task_id, replace=True
         )
 
-        self.assertEqual(job1, job2)  # Same job ID
+        # Verify both job references have the same ID
+        self.assertEqual(job1_id, job2_id)
 
-        time.sleep(1)
+        # Get updated status and verify it reflects the new task configuration
+        updated_status = self.scheduler.get_task_status(task_id)
+        self.assertIsNotNone(updated_status)
 
-        # Both should reference the same job (the second one)
-        status = self.scheduler.get_task_status(task_id)
-        self.assertIsNotNone(status)
+        # Additional verification: check that only one job with this ID exists in the scheduler
+        all_jobs = self.scheduler.list_tasks()
+        task_ids = [job['id'] for job in all_jobs]
+        assert task_ids.count(
+            task_id) == 1, f"Should only be one job with ID {task_id}, found {task_ids.count(task_id)}"
 
-    def test_14_edge_case_invalid_parameters(self):
+    def test_15_edge_case_invalid_parameters(self):
         """Test behavior with invalid parameters."""
         # Test with invalid function
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             self.scheduler.add_interval_task(
                 None, 1, "invalid_function_test"
             )
@@ -326,7 +348,7 @@ class TestAdvancedScheduler(unittest.TestCase):
                 self.mock_function, -1, "negative_interval_test"
             )
 
-    def test_15_task_pause_and_resume(self):
+    def test_16_task_pause_and_resume(self):
         """Test task pausing and resuming functionality."""
         task_id = "pause_resume_test"
 
@@ -348,7 +370,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         # Should have more calls after resuming
         self.assertGreater(self.mock_function.call_count, call_count_after_pause)
 
-    def test_16_boundary_condition_very_short_interval(self):
+    def test_17_boundary_condition_very_short_interval(self):
         """Test very short interval tasks."""
         task_id = "short_interval_test"
 
@@ -360,7 +382,7 @@ class TestAdvancedScheduler(unittest.TestCase):
 
         self.assertGreaterEqual(self.mock_function.call_count, 3)
 
-    def test_17_boundary_condition_very_long_interval(self):
+    def test_18_boundary_condition_very_long_interval(self):
         """Test very long interval tasks."""
         task_id = "long_interval_test"
 
@@ -374,7 +396,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         # Task should exist but not have executed yet
         self.assertEqual(self.mock_function.call_count, 0)
 
-    def test_18_error_handling_in_tasks(self):
+    def test_19_error_handling_in_tasks(self):
         """Test error handling in task execution."""
         task_id = "error_test"
 
@@ -392,7 +414,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         time.sleep(1.1)
         self.assertTrue(self.scheduler.scheduler.running)
 
-    def test_19_thread_safety_operations(self):
+    def test_20_thread_safety_operations(self):
         """Test thread safety of scheduler operations."""
         results = []
 
@@ -426,7 +448,7 @@ class TestAdvancedScheduler(unittest.TestCase):
         self.assertEqual(len(results), 5)
         self.assertTrue(all("success" in r for r in results))
 
-    def test_20_comprehensive_lifecycle_management(self):
+    def test_21_comprehensive_lifecycle_management(self):
         """Test comprehensive lifecycle management of tasks and threads."""
         task_ids = []
 
@@ -454,6 +476,9 @@ class TestAdvancedScheduler(unittest.TestCase):
         # Clean shutdown
         self.scheduler.shutdown(wait=True)
         self.assertFalse(self.scheduler.scheduler.running)
+
+        # Avoid shutdown again in teardown.
+        self.scheduler = None
 
 
 if __name__ == "__main__":
