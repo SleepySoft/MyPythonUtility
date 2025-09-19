@@ -25,7 +25,6 @@ from concurrent.futures import ThreadPoolExecutor as ConcurrentThreadPoolExecuto
 
 def get_system_timezone():
     tz = tzlocal.get_localzone()
-    print(f"Timezone: {type(tz)}")  # 打印类型以便调试
     return tz
 
 
@@ -576,15 +575,46 @@ class AdvancedScheduler:
             self.logger.warning("Job not found")
             return False
 
-        if not isinstance(job.trigger, (IntervalTrigger, CronTrigger)):
-            self.logger.warning(f"Job {job.id} is not resettable")
+        if not isinstance(job.trigger, IntervalTrigger):
+            self.logger.warning(f"Job {job.id} is not an IntervalTrigger and cannot be reset in this way.")
             return False
 
+        # 记录重置前的状态
+        original_next_run = job.next_run_time
+        current_time = get_aware_time()
+        self.logger.info(
+            f"Before reset - Job '{job.id}': current_time={current_time}, original_next_run={original_next_run}")
+
         try:
-            job.reschedule(trigger=job.trigger)
+            # 计算新的开始时间：当前时间 + 间隔
+            interval_seconds = job.trigger.interval.total_seconds()
+            new_start_date = current_time + datetime.timedelta(seconds=interval_seconds)
+
+            new_trigger = IntervalTrigger(
+                seconds=interval_seconds,
+                start_date=new_start_date
+            )
+
+            # 重新调度作业
+            self.scheduler.reschedule_job(job_id=job.id, trigger=new_trigger)
+
+            # 重新获取job对象以获取更新后的next_run_time
+            updated_job = self.scheduler.get_job(job.id)
+            new_next_run = updated_job.next_run_time if updated_job else None
+
+            self.logger.info(f"Timer for job '{job.id}' has been reset. "
+                             f"New start date: {new_start_date}. "
+                             f"Next run time: {new_next_run}")
             return True
+
+        except AttributeError as e:
+            self.logger.error(f"Failed to reset job timer due to missing attribute: {e}")
+            return False
+        except ValueError as e:
+            self.logger.error(f"Failed to reset job timer due to value error: {e}")
+            return False
         except Exception as e:
-            self.logger.error(f"Reset failed: {e}")
+            self.logger.error(f"Failed to reset job timer: {e}")
             return False
 
     def _schedule_task_execution(self, func: Callable[..., Any], task_id: str,

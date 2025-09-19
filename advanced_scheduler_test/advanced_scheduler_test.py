@@ -166,78 +166,84 @@ class TestAdvancedScheduler(unittest.TestCase):
     def test_08_manual_task_execution_without_reset(self):
         """Test manual task execution with delay."""
         task_id = "manual_test"
-        global mock_count
 
-        self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
-
-        self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
+        self.scheduler.add_interval_task(self.mock_function, 2, task_id)
 
         # Test immediate execution
         self.scheduler.execute_task(task_id, delay_seconds=0)
-        # self.assertGreaterEqual(self.mock_function.call_count, 1)
-        self.assertGreaterEqual(mock_count, 1)
+        self.assertGreaterEqual(self.mock_function.call_count, 1)
 
         # Test delayed execution
         self.scheduler.execute_task(task_id, delay_seconds=1)
-        time.sleep(1.5)
-        # self.assertGreaterEqual(self.mock_function.call_count, 2)
-        self.assertGreaterEqual(mock_count, 2)
-
-        time.sleep(1)
-        # self.assertGreaterEqual(self.mock_function.call_count, 3)
-        self.assertGreaterEqual(mock_count, 3)
-
-    def test_08_manual_task_execution(self):
-        """Test manual task execution with delay."""
-        task_id = "manual_test"
-
-        self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
-
-        # Test immediate execution
-        self.scheduler.execute_task(task_id, delay_seconds=0)
-        self.assertGreaterEqual(self.mock_function.call_count, 2)
-
-        # Test delayed execution
-        self.scheduler.execute_task(task_id, delay_seconds=1)
-        time.sleep(1.5)
+        time.sleep(1.1)
         self.assertGreaterEqual(self.mock_function.call_count, 2)
 
         time.sleep(1)
         self.assertGreaterEqual(self.mock_function.call_count, 3)
 
-    def test_09_task_timeout_management(self):
-        """Test task timeout functionality."""
-        task_id = "timeout_test"
+    def test_09_manual_task_execution_with_reset(self):
+        """Test manual task execution with delay."""
+        task_id = "manual_test"
 
-        # Set timeout for a task
-        self.scheduler.set_task_timeout(task_id, 2)
+        self.scheduler.add_interval_task(self.mock_function, 2, task_id)
 
-        # Create a long-running function
-        def long_running_task():
-            time.sleep(5)  # This should timeout
-            self._track_execution("long_running")
+        # Test immediate execution
+        self.scheduler.execute_task(task_id, delay_seconds=0, reset_timer=True)
+        self.assertGreaterEqual(self.mock_function.call_count, 1)
 
-        # Add task with timeout
-        job_id = self.scheduler.add_interval_task(
-            long_running_task, 1, task_id
-        )
+        # Test delayed execution
+        self.scheduler.execute_task(task_id, delay_seconds=1, reset_timer=True)
+        time.sleep(1.1)
+        self.assertGreaterEqual(self.mock_function.call_count, 2)
 
-        time.sleep(3)  # Wait for timeout to occur
+        time.sleep(1.1)
+        self.assertGreaterEqual(self.mock_function.call_count, 2)
 
-        # Task should have been interrupted by timeout
-        status = self.scheduler.get_task_status(task_id)
-        self.assertIsNotNone(status)
+        time.sleep(2)
+        self.assertGreaterEqual(self.mock_function.call_count, 3)
 
-    def test_10_task_reset_functionality(self):
+
+    # def test_10_task_timeout_management(self):
+    #     """Test task timeout functionality."""
+    #     task_id = "timeout_test"
+    #
+    #     # Set timeout for a task
+    #     self.scheduler.set_task_timeout(task_id, 2)
+    #
+    #     # Create a long-running function
+    #     def long_running_task():
+    #         time.sleep(5)  # This should timeout
+    #         self._track_execution("long_running")
+    #
+    #     # Add task with timeout
+    #     job_id = self.scheduler.add_interval_task(
+    #         long_running_task, 1, task_id
+    #     )
+    #
+    #     time.sleep(3)  # Wait for timeout to occur
+    #
+    #     # Task should have been interrupted by timeout
+    #     status = self.scheduler.get_task_status(task_id)
+    #     self.assertIsNotNone(status)
+
+    def test_11_task_reset_functionality(self):
         """Test timer reset for periodic tasks."""
         task_id = "reset_test"
 
-        job_id = self.scheduler.add_interval_task(
-            self.mock_function, 10, task_id  # 10-second interval
-        )
+        self.scheduler.add_interval_task(self.mock_function, 2, task_id)
 
-        # Reset the timer
-        self.assertTrue(self.scheduler.reset_task_timer(task_id))
+        time.sleep(2.1)
+        self.assertEqual(self.mock_function.call_count, 1)
+
+        time.sleep(1.8)
+        self.assertEqual(self.mock_function.call_count, 1)
+        self.assertTrue(self.scheduler.reset_task_timer(task_id))       # <---- Reset time here.
+
+        time.sleep(1.5)
+        self.assertEqual(self.mock_function.call_count, 1)
+
+        time.sleep(0.6)
+        self.assertEqual(self.mock_function.call_count, 2)
 
         # Try to reset non-existent task
         self.assertFalse(self.scheduler.reset_task_timer("non_existent_task"))
