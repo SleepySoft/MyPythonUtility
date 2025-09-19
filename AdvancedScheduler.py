@@ -1,11 +1,13 @@
 import time
+import tzlocal
 import logging
+import datetime
 import threading
 import traceback
 
 from logging import Logger
-from datetime import datetime, timedelta
 from typing import Callable, Any, Optional, Dict, List, Union
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -21,6 +23,25 @@ from apscheduler.events import (
 from concurrent.futures import ThreadPoolExecutor as ConcurrentThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 
+def get_system_timezone():
+    tz = tzlocal.get_localzone()
+    print(f"Timezone: {type(tz)}")  # 打印类型以便调试
+    return tz
+
+
+def naive_time_to_aware_time(naive_time: datetime.datetime) -> datetime.datetime:
+    system_timezone = get_system_timezone()
+    if hasattr(system_timezone, 'localize'):
+        return system_timezone.localize(naive_time)
+    else:
+        return naive_time.replace(tzinfo=system_timezone)
+
+
+def get_aware_time() -> datetime.datetime:
+    system_timezone = get_system_timezone()
+    return datetime.datetime.now(system_timezone)
+
+
 class TaskWrapper:
     """
     A wrapper class for tasks, preserving execution context and enabling execution via thread pool.
@@ -28,7 +49,7 @@ class TaskWrapper:
     """
 
     def __init__(self, func: Callable[..., Any], task_id: str,
-                 logger: Logger, use_new_thread: bool, *args, **kwargs):
+                 logger: Logger, use_new_thread: bool, args: tuple, kwargs: dict):
         """
         Initialize the TaskWrapper with execution context.
 
@@ -47,7 +68,7 @@ class TaskWrapper:
         self.args = args
         self.kwargs = kwargs
         # Preserve the context when the task was created
-        self.creation_time = datetime.now()
+        self.creation_time = get_aware_time()
         self.creation_thread = threading.current_thread().name
 
     def __call__(self) -> None:
@@ -114,7 +135,7 @@ class AdvancedScheduler:
                 jobstores=jobstores,
                 executors=executors,
                 job_defaults=job_defaults,
-                timezone='UTC'
+                timezone=get_system_timezone()
             )
             self.logger.info("BackgroundScheduler initialized.")
         else:
@@ -122,7 +143,7 @@ class AdvancedScheduler:
                 jobstores=jobstores,
                 executors=executors,
                 job_defaults=job_defaults,
-                timezone='UTC'
+                timezone=get_system_timezone()
             )
             self.logger.info("BlockingScheduler initialized.")
 
@@ -150,10 +171,10 @@ class AdvancedScheduler:
             self.logger.info(f"Job {event.job_id} removed")
         elif event.code == EVENT_JOB_ERROR and event.exception:
             self.task_states[event.job_id] = "ERROR"
-            self.logger.error(f"Job {event.job_id} failed with exception: {event.exception}")
+            # self.logger.error(f"Job {event.job_id} failed with exception: {event.exception}")
         elif event.code == EVENT_JOB_EXECUTED:
             self.task_states[event.job_id] = "SUCCESS"
-            self.logger.info(f"Job {event.job_id} executed successfully")
+            # self.logger.info(f"Job {event.job_id} executed successfully")
         elif event.code == EVENT_JOB_MAX_INSTANCES:
             self.logger.warning(f"Job {event.job_id} reached maximum instances, skipping run.")
         elif event.code == EVENT_JOB_MISSED:
@@ -174,7 +195,7 @@ class AdvancedScheduler:
         self.logger.info("Scheduler shutdown completed")
 
     def add_interval_task(self, func: Callable[..., Any], interval_seconds: int,
-                          task_id: str, args: list = None, kwargs: dict = None,
+                          task_id: str, args: tuple = None, kwargs: dict = None,
                           use_new_thread: bool = False, start_immediately: bool = True) -> str:
         """
         Add a periodic task that runs at fixed intervals.
@@ -191,12 +212,12 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
-        args = args or []
+        args = args or ()
         kwargs = kwargs or {}
 
         trigger_args = {'seconds': interval_seconds}
         if not start_immediately:
-            trigger_args['start_date'] = datetime.now() + timedelta(seconds=interval_seconds)
+            trigger_args['start_date'] = get_aware_time() + datetime.timedelta(seconds=interval_seconds)
 
         try:
             # Create TaskWrapper instance
@@ -205,8 +226,8 @@ class AdvancedScheduler:
                 task_id=task_id,
                 logger=self.logger,
                 use_new_thread=use_new_thread,
-                *args,
-                **kwargs
+                args=args,
+                kwargs=kwargs
             )
 
             job = self.scheduler.add_job(
@@ -227,7 +248,7 @@ class AdvancedScheduler:
                       year: str = None, month: str = None, day: str = None,
                       week: str = None, day_of_week: str = None,
                       hour: str = None, minute: str = None, second: str = None,
-                      args: list = None, kwargs: dict = None,
+                      args: tuple = None, kwargs: dict = None,
                       use_new_thread: bool = False) -> str:
         """
         Add a cron-style task with flexible scheduling options.
@@ -250,7 +271,7 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
-        args = args or []
+        args = args or ()
         kwargs = kwargs or {}
 
         # Create TaskWrapper instance
@@ -259,8 +280,8 @@ class AdvancedScheduler:
             task_id=task_id,
             logger=self.logger,
             use_new_thread=use_new_thread,
-            *args,
-            **kwargs
+            args=args,
+            kwargs=kwargs
         )
 
         job = self.scheduler.add_job(
@@ -282,7 +303,7 @@ class AdvancedScheduler:
 
     def add_daily_task(self, func: Callable[..., Any], task_id: str,
                        hour: int = 0, minute: int = 0, second: int = 0,
-                       args: list = None, kwargs: dict = None,
+                       args: tuple = None, kwargs: dict = None,
                        use_new_thread: bool = False) -> str:
         """
         Add a task that runs daily at specified time.
@@ -307,7 +328,7 @@ class AdvancedScheduler:
 
     def add_weekly_task(self, func: Callable[..., Any], task_id: str,
                         day_of_week: str, hour: int = 0, minute: int = 0, second: int = 0,
-                        args: list = None, kwargs: dict = None,
+                        args: tuple = None, kwargs: dict = None,
                         use_new_thread: bool = False) -> str:
         """
         Add a task that runs weekly on specified day and time.
@@ -333,7 +354,7 @@ class AdvancedScheduler:
 
     def add_monthly_task(self, func: Callable[..., Any], task_id: str,
                          day: int = 1, hour: int = 0, minute: int = 0, second: int = 0,
-                         args: list = None, kwargs: dict = None,
+                         args: tuple = None, kwargs: dict = None,
                          use_new_thread: bool = False) -> str:
         """
         Add a task that runs monthly on specified day and time.
@@ -358,7 +379,7 @@ class AdvancedScheduler:
         )
 
     def add_once_task(self, func: Callable[..., Any], task_id: str, delay_seconds: int = 0,
-                      args: list = None, kwargs: dict = None, use_new_thread: bool = False) -> str:
+                      args: tuple = None, kwargs: dict = None, use_new_thread: bool = False) -> str:
         """
         Adds a task that executes only once, either immediately or with a delay.
 
@@ -375,7 +396,7 @@ class AdvancedScheduler:
         """
         return self._schedule_task_execution(
             func, task_id, delay_seconds, use_new_thread,
-            *(args or []), **(kwargs or {})
+            *(args or ()), **(kwargs or {})
         )
 
     def execute_task(self, task_id: str, delay_seconds: int = 0, reset_timer: bool = False) -> bool:
@@ -396,23 +417,20 @@ class AdvancedScheduler:
             self.logger.error(f"Task '{task_id}' not found")
             return False
 
-        use_new_thread = job.func.use_new_thread
         args = job.func.args
         kwargs = job.func.kwargs
         real_func = job.func.func
+        use_new_thread = job.func.use_new_thread
 
         try:
-            if not use_new_thread and delay_seconds == 0:
-                real_func(*args, **kwargs)
-            else:
-                self._schedule_task_execution(
-                    real_func,
-                    f"manual_{task_id}",  # Use different ID to avoid conflict
-                    delay_seconds,
-                    use_new_thread,
-                    *args,
-                    **kwargs
-                )
+            self._schedule_task_execution(
+                real_func,
+                f"manual_{task_id}_{time.time()}",  # Use different ID to avoid conflict
+                delay_seconds,
+                use_new_thread,
+                *args,
+                **kwargs
+            )
             # Handle periodic task reset
             return self._do_reset_task_timer(job) if reset_timer else True
 
@@ -423,7 +441,7 @@ class AdvancedScheduler:
     def delay_task(self, task_id: str, delay_seconds: int):
         job = self.scheduler.get_job(task_id)
         if job:
-            new_time = datetime.now() + timedelta(seconds=delay_seconds)
+            new_time = get_aware_time() + datetime.timedelta(seconds=delay_seconds)
             job.modify(next_run_time=new_time)
 
     def reset_task_timer(self, task_id: str) -> bool:
@@ -587,6 +605,9 @@ class AdvancedScheduler:
         Returns:
             Generated job ID
         """
+        args = args or ()
+        kwargs = kwargs or {}
+
         if not use_new_thread and delay_seconds == 0:
             func(*args, **kwargs)
             return task_id
@@ -597,12 +618,12 @@ class AdvancedScheduler:
                 task_id=task_id,
                 logger=self.logger,
                 use_new_thread=use_new_thread,
-                *args,
-                **kwargs
+                args=args,
+                kwargs=kwargs
             )
 
             # Calculate run time (now for immediate, future for delayed)
-            run_date = datetime.now() + timedelta(seconds=delay_seconds)
+            run_date = get_aware_time() + datetime.timedelta(seconds=delay_seconds)
 
             # Schedule the task using APScheduler's date trigger
             job = self.scheduler.add_job(
@@ -652,23 +673,54 @@ class AdvancedScheduler:
 
 # Example usage and demonstration
 if __name__ == "__main__":
+    sample_task_counter = 0
+
     # Configure logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # Create scheduler instance (BackgroundScheduler)
     scheduler = AdvancedScheduler(use_background_scheduler=True)
-
+    scheduler.start_scheduler()
 
     # Example tasks
     def sample_task(name: str = "default"):
-        print(f"Executing task: {name} at {datetime.now()}. Thread: {threading.current_thread().name}")
-
+        global sample_task_counter
+        sample_task_counter += 1
+        print(f"Executing task: {name} at {get_aware_time()} {sample_task_counter} times. Thread: {threading.current_thread().name}")
 
     def long_running_task():
         time.sleep(8)
         print(f"Long running task completed. Thread: {threading.current_thread().name}")
 
-    # Keep the program running
+    scheduler.add_interval_task(sample_task, 100, 'sample_task_1')
+
+    scheduler.execute_task('sample_task_1', delay_seconds=1)
+    scheduler.execute_task('sample_task_1', delay_seconds=2)
+    time.sleep(1.1)
+    print(f'Task running times: {sample_task_counter}, expect: 1')
+    time.sleep(1.1)
+    print(f'Task running times: {sample_task_counter}, expect: 2')
+
+    # -------------------------------------------------------------------------------
+
+    # scheduler.add_interval_task(sample_task, 2, 'sample_task_1')
+    # time.sleep(2.1)
+    # print(f'Task running times: {sample_task_counter}, expect: 1')
+    #
+    # scheduler.execute_task('sample_task_1', delay_seconds=0)
+    # print(f'Task running times: {sample_task_counter}, expect: 2')
+    #
+    # scheduler.execute_task('sample_task_1', delay_seconds=1)
+    # time.sleep(1.1)
+    # print(f'Task running times: {sample_task_counter}, expect: 3')
+    #
+    # time.sleep(1.1)
+    # print(f'Task running times: {sample_task_counter}, expect: 4')
+    # scheduler.remove_task('sample_task_1')
+    #
+    # time.sleep(3)
+    # print(f'Task running times: {sample_task_counter}')
+
     try:
         while True:
             time.sleep(2)

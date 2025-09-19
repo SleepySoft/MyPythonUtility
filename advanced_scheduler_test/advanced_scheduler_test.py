@@ -21,9 +21,9 @@ mock_count = 0
 
 
 def mock_function_counter():
-    print('Execute mock function.')
     global mock_count
     mock_count += 1
+    print(f'Execute mock function: {mock_count}')
 
 
 class TestAdvancedScheduler(unittest.TestCase):
@@ -167,6 +167,8 @@ class TestAdvancedScheduler(unittest.TestCase):
         """Test manual task execution with delay."""
         task_id = "manual_test"
         global mock_count
+
+        self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
 
         self.scheduler.add_interval_task(mock_function_counter, 3, task_id)
 
