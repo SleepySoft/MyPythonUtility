@@ -11,7 +11,6 @@ from typing import Callable, Any, Optional, Dict, List, Union
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.executors.pool import ThreadPoolExecutor, ProcessPoolExecutor
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.events import (
@@ -21,8 +20,6 @@ from apscheduler.events import (
     EVENT_JOB_REMOVED, EVENT_JOB_MAX_INSTANCES
 )
 from concurrent.futures import ThreadPoolExecutor as ConcurrentThreadPoolExecutor, TimeoutError as FutureTimeoutError
-
-from sympy.codegen.ast import Raise
 
 
 def get_system_timezone():
@@ -153,6 +150,10 @@ class AdvancedScheduler:
         self.task_timeouts = {}
         self._running_tasks_lock = threading.RLock()  # Use RLock for potential nested locking
 
+        # Counter and lock for automatic task ID generation
+        self._task_id_counter = 0
+        self._task_id_lock = threading.Lock()
+
         # Set up event listeners for job execution events
         self.scheduler.add_listener(self._job_listener,
                                     EVENT_JOB_EXECUTED | EVENT_JOB_ERROR |
@@ -198,7 +199,7 @@ class AdvancedScheduler:
     # ------------------------------------------------------------------------------------------------------------------
 
     def add_interval_task(self, func: Callable[..., Any], interval_seconds: int,
-                          task_id: str, replace: bool = False, args: tuple = None, kwargs: dict = None,
+                          task_id: Optional[str] = None, replace: bool = False, args: tuple = None, kwargs: dict = None,
                           use_new_thread: bool = False, start_immediately: bool = True) -> str:
         """
         Add a periodic task that runs at fixed intervals.
@@ -206,7 +207,7 @@ class AdvancedScheduler:
         Args:
             func: Function to be executed
             interval_seconds: Interval in seconds between executions
-            task_id: Unique identifier for the task
+            task_id: Unique identifier for the task. If None, one will be generated.
             replace: Replace if it has task with  same id
             args: Positional arguments for the function
             kwargs: Keyword arguments for the function
@@ -220,7 +221,11 @@ class AdvancedScheduler:
             raise ValueError('Invalid task function.')
         if interval_seconds <= 0:
             raise ValueError('Invalid task interval.')
-        self._check_handle_duplicated_task_id(task_id, replace)
+
+        if task_id is None:
+            task_id = self._generate_task_id("interval")
+        else:
+            self._check_handle_duplicated_task_id(task_id, replace)
 
         args = args or ()
         kwargs = kwargs or {}
@@ -254,7 +259,7 @@ class AdvancedScheduler:
             traceback.print_exc()
             raise
 
-    def add_cron_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
+    def add_cron_task(self, func: Callable[..., Any], task_id: Optional[str] = None, replace: bool = False,
                       year: str = None, month: str = None, day: str = None,
                       week: str = None, day_of_week: str = None,
                       hour: str = None, minute: str = None, second: str = None,
@@ -265,7 +270,7 @@ class AdvancedScheduler:
 
         Args:
             func: Function to be executed
-            task_id: Unique identifier for the task
+            task_id: Unique identifier for the task. If None, one will be generated.
             replace: Replace if it has task with  same id
             year: Year expression (e.g., '2023', '2023-2025')
             month: Month expression (e.g., '1-12', '*/3')
@@ -284,7 +289,11 @@ class AdvancedScheduler:
         """
         if not func:
             raise ValueError('Invalid task function.')
-        self._check_handle_duplicated_task_id(task_id, replace)
+
+        if task_id is None:
+            task_id = self._generate_task_id("cron")
+        else:
+            self._check_handle_duplicated_task_id(task_id, replace)
 
         args = args or ()
         kwargs = kwargs or {}
@@ -316,7 +325,36 @@ class AdvancedScheduler:
         self.logger.info(f"Cron task '{task_id}' added. Use new thread: {use_new_thread}")
         return job.id
 
-    def add_daily_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
+    def add_hourly_task(self, func: Callable[..., Any], task_id: Optional[str] = None, replace: bool = False,
+                        minute: int = 0, second: int = 0,
+                        args: tuple = None, kwargs: dict = None,
+                        use_new_thread: bool = False) -> str:
+        """
+        Add a task that runs hourly at a specified minute and second.
+
+        Args:
+            func: Function to be executed
+            task_id: Unique identifier for the task. If None, one will be generated.
+            replace: Replace if a task with the same id exists
+            minute: Minute of the hour (0-59)
+            second: Second of the minute (0-59)
+            args: Positional arguments for the function
+            kwargs: Keyword arguments for the function
+            use_new_thread: If True, the task will be executed in a new daemon thread.
+
+        Returns:
+            Job ID of the created task
+        """
+        if task_id is None:
+            task_id = self._generate_task_id("hourly")
+
+        return self.add_cron_task(
+            func, task_id, replace=replace,
+            minute=str(minute), second=str(second),
+            args=args, kwargs=kwargs, use_new_thread=use_new_thread
+        )
+
+    def add_daily_task(self, func: Callable[..., Any], task_id: Optional[str] = None, replace: bool = False,
                        hour: int = 0, minute: int = 0, second: int = 0,
                        args: tuple = None, kwargs: dict = None,
                        use_new_thread: bool = False) -> str:
@@ -325,7 +363,7 @@ class AdvancedScheduler:
 
         Args:
             func: Function to be executed
-            task_id: Unique identifier for the task
+            task_id: Unique identifier for the task. If None, one will be generated.
             replace: Replace if it has task with  same id
             hour: Hour of day (0-23)
             minute: Minute of hour (0-59)
@@ -337,12 +375,16 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
+        if task_id is None:
+            task_id = self._generate_task_id("daily")
+
         return self.add_cron_task(
-            func, task_id, hour=str(hour), minute=str(minute), second=str(second),
+            func, task_id, replace=replace,
+            hour=str(hour), minute=str(minute), second=str(second),
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def add_weekly_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
+    def add_weekly_task(self, func: Callable[..., Any], task_id: Optional[str] = None, replace: bool = False,
                         day_of_week: str = 'mon', hour: int = 0, minute: int = 0, second: int = 0,
                         args: tuple = None, kwargs: dict = None,
                         use_new_thread: bool = False) -> str:
@@ -351,7 +393,7 @@ class AdvancedScheduler:
 
         Args:
             func: Function to be executed
-            task_id: Unique identifier for the task
+            task_id: Unique identifier for the task. If None, one will be generated.
             replace: Replace if it has task with  same id
             day_of_week: Day of week ('mon', 'tue', etc. or '0-6')
             hour: Hour of day (0-23)
@@ -364,13 +406,16 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
+        if task_id is None:
+            task_id = self._generate_task_id("weekly")
+
         return self.add_cron_task(
             func, task_id, day_of_week=day_of_week, replace=replace,
             hour=str(hour), minute=str(minute), second=str(second),
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def add_monthly_task(self, func: Callable[..., Any], task_id: str, replace: bool = False,
+    def add_monthly_task(self, func: Callable[..., Any], task_id: Optional[str] = None, replace: bool = False,
                          day: int = 1, hour: int = 0, minute: int = 0, second: int = 0,
                          args: tuple = None, kwargs: dict = None,
                          use_new_thread: bool = False) -> str:
@@ -379,7 +424,7 @@ class AdvancedScheduler:
 
         Args:
             func: Function to be executed
-            task_id: Unique identifier for the task
+            task_id: Unique identifier for the task. If None, one will be generated.
             replace: Replace if it has task with  same id
             day: Day of month (1-31)
             hour: Hour of day (0-23)
@@ -392,20 +437,23 @@ class AdvancedScheduler:
         Returns:
             Job ID of the created task
         """
+        if task_id is None:
+            task_id = self._generate_task_id("monthly")
+
         return self.add_cron_task(
             func, task_id, replace=replace,
             day=str(day), hour=str(hour), minute=str(minute), second=str(second),
             args=args, kwargs=kwargs, use_new_thread=use_new_thread
         )
 
-    def add_once_task(self, func: Callable[..., Any], task_id: str, replace: bool = False, delay_seconds: int = 0,
+    def add_once_task(self, func: Callable[..., Any], task_id: Optional[str] = None, replace: bool = False, delay_seconds: int = 0,
                       args: tuple = None, kwargs: dict = None, use_new_thread: bool = False) -> str:
         """
         Adds a task that executes only once, either immediately or with a delay.
 
         Args:
             func: The function to be executed
-            task_id: The unique identifier of the task
+            task_id: Unique identifier for the task. If None, one will be generated.
             replace: Replace if it has task with  same id
             delay_seconds: The number of seconds to delay execution. 0 indicates immediate execution
             args: Positional arguments to the function
@@ -417,7 +465,12 @@ class AdvancedScheduler:
         """
         if not func:
             raise ValueError('Invalid task function.')
-        self._check_handle_duplicated_task_id(task_id, replace)
+
+        if task_id is None:
+            task_id = self._generate_task_id("once")
+        else:
+            self._check_handle_duplicated_task_id(task_id, replace)
+
         return self._schedule_task_execution(
             func, task_id, delay_seconds, use_new_thread,
             *(args or ()), **(kwargs or {})
@@ -599,6 +652,12 @@ class AdvancedScheduler:
 
     # ------------------------------------------------------------------------------------------------------------------
 
+    def _generate_task_id(self, prefix: str) -> str:
+        """Generates a unique task ID with a given prefix."""
+        with self._task_id_lock:
+            self._task_id_counter += 1
+            return f"{prefix}_{self._task_id_counter}"
+
     def _do_reset_task_timer(self, job) -> bool:
         if not job:
             self.logger.warning("Job not found")
@@ -742,7 +801,6 @@ class AdvancedScheduler:
                     f"Job with ID '{task_id}' already exists. "
                     f"Set replace=True to replace the existing job."
                 )
-
 
 # Example usage and demonstration
 if __name__ == "__main__":
