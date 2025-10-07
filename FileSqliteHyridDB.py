@@ -1,9 +1,10 @@
-import sqlite3
 import os
-import uuid
 import re
+import uuid
+import sqlite3
 from datetime import datetime
-from typing import Optional, List, Union, Dict, Any
+from contextlib import contextmanager
+from typing import Optional, List, Union, Dict, Any, ContextManager, IO
 
 
 # Register adapters for datetime objects to be stored as ISO 8601 strings.
@@ -42,15 +43,20 @@ class HybridDB:
     >>> # 1. Initialize the database in a specific directory
     >>> db = HybridDB(root_dir="my_data_storage")
     >>>
-    >>> # 2. Add content. The method returns the unique index (ID).
+    >>> # 2. Add content directly. The method returns the unique index (ID).
     >>> text_id = db.add_text("This is a document.", category="documents", name="sample_doc")
     >>> image_id = db.add_binary(b"...", category="images", name="profile_picture")
     >>>
-    >>> # 3. Find a list of indices based on query parameters. This is a lightweight operation.
+    >>> # 3. Or, write content using a file stream (useful for large files).
+    >>> with db.raw_file(content_type='text', category='logs', name='stream_log') as f:
+    ...     f.write("Log entry 1\\n")
+    ...     f.write("Log entry 2\\n")
+    >>>
+    >>> # 4. Find a list of indices based on query parameters. This is a lightweight operation.
     >>> image_indices = db.find(category="images")
     >>> print(f"Found indices for images: {image_indices}")
     >>>
-    >>> # 4. Fetch the full record details for those indices.
+    >>> # 5. Fetch the full record details for those indices.
     >>> if image_indices:
     ...     image_records = db.get_records_by_indices(image_indices, absolute_path=True)
     ...     print(f"Image records: {image_records}")
@@ -58,14 +64,74 @@ class HybridDB:
     ...     for record in image_records:
     ...         print(f"Processing file at: {record['path']}")
     >>>
-    >>> # 5. Retrieve the actual content for a single index
+    >>> # 6. Retrieve the actual content for a single index
     >>> content = db.get_content_by_index(text_id)
     >>> print(f"Content for ID {text_id}: {content}")
     >>>
-    >>> # 6. Delete a record and its corresponding file by index
+    >>> # 7. Delete a record and its corresponding file by index
     >>> db.delete_by_index(image_id)
     >>> print(f"Deleted record with ID: {image_id}")
     """
+
+    class _FileWriter:
+        def __init__(self, db_instance, content_type, category, name, timestamp):
+            self.db = db_instance
+            # ... 保存所有参数 ...
+            self.content_type = content_type
+            self.category = category
+            self.name = name
+            self.timestamp = timestamp
+
+            # 这个属性将用于保存最终的 index
+            self.index = None
+            self._file = None
+            self.absolute_path = None  # 保存路径用于可能的清理
+
+        def __enter__(self):
+            # 进入 with 语句时执行
+            # 这部分逻辑和之前 raw_file 的 yield 之前部分完全一样
+            self.resolved_name = self.name if self.name else uuid.uuid4().hex
+            self.resolved_time = self.timestamp if self.timestamp else datetime.now()
+            sanitized_category = self.db._sanitize_category(self.category)
+
+            category_dir = os.path.join(self.db._root_dir, sanitized_category)
+            os.makedirs(category_dir, exist_ok=True)
+
+            time_str = self.resolved_time.strftime('%Y%m%d%H%M%S%f')
+            extension = ".txt" if self.content_type == 'text' else ".bin"
+            filename = f"{self.resolved_name}_{time_str}{extension}"
+
+            self.relative_path = os.path.join(sanitized_category, filename)
+            self.absolute_path = os.path.join(self.db._root_dir, self.relative_path)
+
+            mode = 'w' if self.content_type == 'text' else 'wb'
+            encoding = 'utf-8' if self.content_type == 'text' else None
+
+            self._file = open(self.absolute_path, mode, encoding=encoding)
+            return self._file
+
+        def __exit__(self, exc_type, exc_val, traceback):
+            # 退出 with 语句时执行
+            if self._file:
+                self._file.close()
+
+            if exc_type is not None:
+                # 如果发生了异常 (exc_type 不是 None)，则清理文件
+                if os.path.exists(self.absolute_path):
+                    os.remove(self.absolute_path)
+                # 异常会继续被抛出，with 语句不会抑制它
+            else:
+                # 如果没有异常，则写入数据库
+                with self.db._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO records (name, category, timestamp, relative_path, content_type)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (self.resolved_name, self.db._sanitize_category(self.category), self.resolved_time,
+                          self.relative_path, self.content_type))
+                    # 关键一步：把新生成的 ID 保存到自己身上！
+                    self.index = cursor.lastrowid
+                    conn.commit()
 
     def __init__(self, root_dir: str):
         """
@@ -186,6 +252,161 @@ class HybridDB:
             int: The unique index (ID) of the stored content.
         """
         return self._add(content, 'binary', category, name, timestamp)
+
+    def raw_file(self,
+                 content_type: str,
+                 category: str = "default",
+                 name: Optional[str] = None,
+                 timestamp: Optional[datetime] = None) -> '_FileWriter':
+        """Returns a file writer object that acts as a context manager.
+
+        This method is the preferred way to handle large files or data streams,
+        as it writes content directly to the filesystem without loading the
+        entire content into memory first.
+
+        The operation is atomic: the corresponding database record is created
+        only upon the successful completion of the `with` block. If any
+        exception occurs during the write process, the created file is
+        automatically removed, and no database entry is made.
+
+        After the `with` block exits successfully, the unique ID of the new
+        record is available via the `.index` attribute on the returned writer
+        object.
+
+        Args:
+            content_type (str): The type of content, must be either 'text' or
+                'binary'. This determines the file open mode ('w' vs 'wb')
+                and the resulting file extension ('.txt' vs '.bin').
+            category (str, optional): A category to organize the content. This
+                translates to a subdirectory within the root directory.
+                Defaults to "default".
+            name (Optional[str], optional): A logical name for the content. If
+                None, a random UUID4 hex string is used. Defaults to None.
+            timestamp (Optional[datetime], optional): The timestamp for the
+                entry. If None, the current time (`datetime.now()`) is used.
+                Defaults to None.
+
+        Returns:
+            _FileWriter: An object that serves as a context manager. You use
+                this object in a `with` statement to get a writable file
+                handle. After the `with` block, its `.index` attribute will
+                be populated with the new record's ID.
+
+        Raises:
+            ValueError: If `content_type` is not 'text' or 'binary'.
+            IOError: If the file cannot be opened or written to.
+            sqlite3.Error: If an error occurs during the database insertion.
+
+        Example:
+            >>> db = HybridDB(root_dir="production_data")
+            >>> # The method returns a writer object.
+            >>> writer = db.raw_file(
+            ...     content_type='text',
+            ...     category='daily_logs',
+            ...     name='system_events'
+            ... )
+            >>>
+            >>> # Use the writer object in a 'with' statement.
+            >>> with writer as f:
+            ...     f.write("Log entry 1: System started.\\n")
+            ...     f.write("Log entry 2: Processing jobs.\\n")
+            ...     # At this point, writer.index is still None.
+            ...
+            >>> # After the 'with' block, the file is saved and the DB is updated.
+            >>> # The index is now available on the writer object.
+            >>> new_id = writer.index
+            >>> print(f"Successfully created log file with index: {new_id}")
+            >>>
+            >>> # You can now use the new_id to retrieve the content.
+            >>> content = db.get_content_by_index(new_id)
+            >>> print(content)
+            Log entry 1: System started.
+            Log entry 2: Processing jobs.
+        """
+        if content_type not in ['text', 'binary']:
+            raise ValueError("content_type must be 'text' or 'binary'")
+        return self._FileWriter(self, content_type, category, name, timestamp)
+
+    # @contextmanager
+    # def raw_file(self,
+    #              content_type: str,
+    #              category: str = "default",
+    #              name: Optional[str] = None,
+    #              timestamp: Optional[datetime] = None) -> ContextManager[IO]:
+    #     """
+    #     Provides a context manager to write directly to a file stream.
+    #
+    #     This method is useful for large content or when content is generated
+    #     on-the-fly, as it avoids loading the entire content into memory. The database
+    #     record is only created if the 'with' block completes without errors.
+    #
+    #     Note: This method does not return the ID of the created record. You can use
+    #     the 'find' method to locate the record after it has been created.
+    #
+    #     Args:
+    #         content_type (str): The type of content, must be either 'text' or 'binary'.
+    #         category (str, optional): A category to organize the content. Defaults to "default".
+    #         name (Optional[str], optional): A name for the content. If None, a UUID4 hex is used.
+    #         timestamp (Optional[datetime], optional): The timestamp. If None, current time is used.
+    #
+    #     Yields:
+    #         A file-like object to write to.
+    #
+    #     Usage:
+    #         >>> db = HybridDB(root_dir="my_streaming_data")
+    #         >>> with db.raw_file('text', category='logs', name='stream_log') as f:
+    #         ...     f.write("Log entry 1\\n")
+    #         ...     # If an error occurs here, the file is deleted and no DB record is made.
+    #         >>> # If successful, the file and DB record now exist.
+    #
+    #     Raises:
+    #         ValueError: If content_type is not 'text' or 'binary'.
+    #     """
+    #     if content_type not in ['text', 'binary']:
+    #         raise ValueError("content_type must be 'text' or 'binary'")
+    #
+    #     # 1. Prepare metadata and paths (similar to _add)
+    #     resolved_name = name if name else uuid.uuid4().hex
+    #     resolved_time = timestamp if timestamp else datetime.now()
+    #     sanitized_category = self._sanitize_category(category) if category else "default"
+    #
+    #     category_dir = os.path.join(self._root_dir, sanitized_category)
+    #     os.makedirs(category_dir, exist_ok=True)
+    #
+    #     time_str = resolved_time.strftime('%Y%m%d%H%M%S%f')
+    #     extension = ".txt" if content_type == 'text' else ".bin"
+    #     filename = f"{resolved_name}_{time_str}{extension}"
+    #
+    #     relative_path = os.path.join(sanitized_category, filename)
+    #     absolute_path = os.path.join(self._root_dir, relative_path)
+    #
+    #     mode = 'w' if content_type == 'text' else 'wb'
+    #     encoding = 'utf-8' if content_type == 'text' else None
+    #
+    #     # 2. Manage file and DB transaction atomically
+    #     try:
+    #         with open(absolute_path, mode, encoding=encoding) as f:
+    #             yield f
+    #         # The 'with' block finished without error.
+    #     except Exception:
+    #         # An error occurred during open() or in the user's code. Clean up.
+    #         if os.path.exists(absolute_path):
+    #             os.remove(absolute_path)
+    #         raise  # Re-raise the original exception
+    #     else:
+    #         # The file was successfully written and closed. Now, create the DB record.
+    #         with self._get_connection() as conn:
+    #             cursor = conn.cursor()
+    #             try:
+    #                 cursor.execute("""
+    #                     INSERT INTO records (name, category, timestamp, relative_path, content_type)
+    #                     VALUES (?, ?, ?, ?, ?)
+    #                 """, (resolved_name, sanitized_category, resolved_time, relative_path, content_type))
+    #                 conn.commit()
+    #             except sqlite3.IntegrityError as e:
+    #                 # This is a rare condition (e.g., race condition), but good to handle.
+    #                 os.remove(absolute_path)
+    #                 raise ValueError(f"Failed to add record to database, likely a path conflict: {e}") from e
 
     def _format_row(self, row: sqlite3.Row, use_absolute_path: bool) -> Dict[str, Any]:
         """Formats a database row into a dictionary, handling path resolution."""
@@ -308,7 +529,7 @@ class HybridDB:
             if os.path.exists(record['path']):
                 os.remove(record['path'])
         except OSError:
-            pass  # Proceed to delete the DB record regardless of file deletion success
+            pass  # Proceed to delete DB record regardless of file deletion success
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
