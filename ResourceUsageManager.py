@@ -249,6 +249,31 @@ class Resource:
             "usage_percentage": pct,
         }
 
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """
+        Return a snapshot of the resource's current statistics.
+        """
+        now = time.time()
+        if self.reset_type == ResetType.SLIDING_WINDOW:
+            self._clean_old_records(now)
+
+        return {
+            "name": self.name,
+            "current_usage": self.current_usage,
+            "limit": self.limit,
+            "usage_percentage": self.get_usage_percentage(),
+            "unit": self.unit,
+            "reset_type": self.reset_type.value,
+            "last_reset": self.last_reset,
+            "next_reset": self.next_reset,
+            "time_until_reset": self.time_until_reset(),
+            "is_limited": self.is_limited(),
+            "metadata": self.metadata,
+            "soft_threshold": self.soft_threshold,
+            "hard_threshold": self.hard_threshold,
+            "group": self.group,
+        }
+
     # ------------------------------------------------------------------ #
     #  Utilities                                                         #
     # ------------------------------------------------------------------ #
@@ -331,39 +356,34 @@ class ResourceUsageManager:
     #  Database bootstrap                                                #
     # ------------------------------------------------------------------ #
     def _init_database(self) -> None:
+        ddl = """
+        CREATE TABLE IF NOT EXISTS resources (
+            name             TEXT PRIMARY KEY,
+            reset_type       TEXT NOT NULL,
+            limit_value      INTEGER NOT NULL,
+            unit             TEXT NOT NULL,
+            window_seconds   INTEGER,
+            cron_pattern     TEXT,
+            last_reset       REAL NOT NULL,
+            next_reset       REAL,
+            current_usage    INTEGER NOT NULL,
+            metadata         TEXT,
+            soft_threshold   INTEGER,
+            hard_threshold   INTEGER,
+            created_at       REAL NOT NULL,
+            updated_at       REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS usage_history (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            resource_name TEXT NOT NULL,
+            timestamp     REAL NOT NULL,
+            amount        INTEGER NOT NULL,
+            FOREIGN KEY (resource_name) REFERENCES resources(name) ON DELETE CASCADE
+        );
+        """
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS resources (
-                    name             TEXT PRIMARY KEY,
-                    reset_type       TEXT NOT NULL,
-                    limit_value      INTEGER NOT NULL,
-                    unit             TEXT NOT NULL,
-                    window_seconds   INTEGER,
-                    cron_pattern     TEXT,
-                    last_reset       REAL NOT NULL,
-                    next_reset       REAL,
-                    current_usage    INTEGER NOT NULL,
-                    metadata         TEXT,
-                    soft_threshold   INTEGER,
-                    hard_threshold   INTEGER,
-                    created_at       REAL NOT NULL,
-                    updated_at       REAL NOT NULL
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS usage_history (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    resource_name TEXT NOT NULL,
-                    timestamp     REAL NOT NULL,
-                    amount        INTEGER NOT NULL,
-                    FOREIGN KEY (resource_name) REFERENCES resources(name) ON DELETE CASCADE
-                """
-            )
-            conn.commit()
+            conn.executescript(ddl)
 
     # ------------------------------------------------------------------ #
     #  Load resources + history                                          #
