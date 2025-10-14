@@ -1,724 +1,777 @@
-"""
-A comprehensive resource-usage management system with grouping and dual-threshold
-availability checks.
-
-The module tracks arbitrary resources that may reset in three ways:
-  - unlimited        – pure counter, never resets
-  - sliding_window   – time window of N seconds
-  - cron             – fixed wall-clock moments (cron syntax)
-
-Every resource belongs to exactly one logical group (default = "default") and
-carries two optional thresholds:
-  - soft_threshold   – usage ≥ soft  ⇒  not recommended
-  - hard_threshold   – usage ≥ hard  ⇒  unavailable
-"""
-
-from __future__ import annotations
-
 import json
-import logging
-import sqlite3
-import threading
 import time
-import uuid
-from datetime import datetime, timedelta
+import sqlite3
+import croniter
+import threading
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union, Any, Tuple
+from dataclasses import dataclass, asdict
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-
-# --------------------------------------------------------------------------- #
-#  Enums                                                                      #
-# --------------------------------------------------------------------------- #
 class ResetType(Enum):
-    UNLIMITED = "unlimited"
-    SLIDING_WINDOW = "sliding_window"
-    CRON = "cron"
+    """Enumeration of resource reset types"""
+    NONE = "none"  # No reset, pure usage tracking
+    SLIDING_WINDOW = "sliding_window"  # Time-based sliding window
+    FIXED_SCHEDULE = "fixed_schedule"  # Cron-like fixed schedule
 
 
-class TimeUnit(Enum):
-    SECONDS = "seconds"
-    MINUTES = "minutes"
-    HOURS = "hours"
-    DAYS = "days"
+class AvailabilityStatus(Enum):
+    """Resource availability status"""
+    AVAILABLE = "available"
+    WARNING = "warning"  # Exceeded first threshold
+    UNAVAILABLE = "unavailable"  # Exceeded second threshold
 
 
-class ResourceUnit(Enum):
-    RPM = "requests_per_minute"
-    TPM = "tokens_per_minute"
-    RPD = "requests_per_day"
-    TOKEN = "tokens"
-    COUNT = "count"
-    MB = "megabytes"
-    GB = "gigabytes"
-    CUSTOM = "custom"
+@dataclass
+class ResourceLimit:
+    """Represents a single limit constraint for a resource"""
+    max_quantity: float
+    reset_config: Dict[str, Any]  # Reset configuration
+    limit_name: str = "default"
+
+    def __post_init__(self):
+        """Validate limit configuration"""
+        if self.max_quantity <= 0:
+            raise ValueError("Max quantity must be positive")
 
 
-class CronFrequency(Enum):
-    HOURLY = "0 * * * *"
-    DAILY = "0 0 * * *"
-    WEEKLY = "0 0 * * 0"
-    MONTHLY = "0 0 1 * *"
-    YEARLY = "0 0 1 1 *"
+class ResetStrategy(ABC):
+    """Abstract base class for reset strategies"""
+
+    @abstractmethod
+    def needs_reset(self, last_reset: float) -> bool:
+        """Check if resource needs reset"""
+        pass
+
+    @abstractmethod
+    def get_usage_period(self) -> Tuple[float, float]:
+        """Get start and end time for usage calculation"""
+        pass
 
 
-# --------------------------------------------------------------------------- #
-#  Cron pattern helper                                                        #
-# --------------------------------------------------------------------------- #
-class CronPattern:
-    """
-    Lightweight cron parser that understands standard 5-field patterns
-    (minute hour day month weekday).  Only 'next reset' is computed.
-    """
+class NoResetStrategy(ResetStrategy):
+    """Strategy for resources that never reset"""
 
-    def __init__(
-        self,
-        pattern: Optional[str] = None,
-        frequency: Optional[CronFrequency] = None,
-    ):
-        if pattern is None and frequency is None:
-            raise ValueError("Either pattern or frequency must be provided")
-        self.pattern = frequency.value if frequency else pattern
-        self.minute, self.hour, self.day, self.month, self.weekday = self.pattern.split()
+    def needs_reset(self, last_reset: float) -> bool:
+        return False
 
-    # --------------------------------------------------------------------- #
-    #  Next reset calculation – good enough for most use-cases              #
-    # --------------------------------------------------------------------- #
-    def get_next_reset(self, current_time: Optional[float] = None) -> float:
-        if current_time is None:
-            current_time = time.time()
-        dt = datetime.fromtimestamp(current_time)
-
-        # Built-ins
-        if self.pattern == CronFrequency.HOURLY.value:
-            nxt = dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        elif self.pattern == CronFrequency.DAILY.value:
-            nxt = dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        elif self.pattern == CronFrequency.WEEKLY.value:
-            days_ahead = (6 - dt.weekday()) % 7 or 7
-            nxt = dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
-        elif self.pattern == CronFrequency.MONTHLY.value:
-            if dt.month == 12:
-                nxt = dt.replace(year=dt.year + 1, month=1, day=1)
-            else:
-                nxt = dt.replace(month=dt.month + 1, day=1)
-            nxt = nxt.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif self.pattern == CronFrequency.YEARLY.value:
-            nxt = dt.replace(year=dt.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        else:
-            # Fallback – daily reset
-            nxt = dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-        return nxt.timestamp()
-
-    # --------------------------------------------------------------------- #
-    #  Serialisation                                                        #
-    # --------------------------------------------------------------------- #
-    def to_dict(self) -> Dict[str, str]:
-        return {"pattern": self.pattern}
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, str]) -> "CronPattern":
-        return cls(pattern=data["pattern"])
+    def get_usage_period(self) -> Tuple[float, float]:
+        return 0, float('inf')
 
 
-# --------------------------------------------------------------------------- #
-#  Resource                                                                   #
-# --------------------------------------------------------------------------- #
-class Resource:
-    """
-    Single resource with usage tracking, reset logic, grouping and thresholds.
-    """
+class SlidingWindowStrategy(ResetStrategy):
+    """Strategy for sliding window reset"""
 
-    def __init__(
-        self,
-        name: str,
-        reset_type: ResetType = ResetType.UNLIMITED,
-        limit: int = 0,
-        unit: Union[ResourceUnit, str] = ResourceUnit.COUNT,
-        window_seconds: Optional[int] = None,
-        cron_pattern: Optional[Union[CronPattern, str, CronFrequency]] = None,
-        last_reset: Optional[float] = None,
-        current_usage: int = 0,
-        metadata: Optional[Dict[str, Any]] = None,
-        group: str = "default",
-        soft_threshold: Optional[int] = None,
-        hard_threshold: Optional[int] = None,
-    ):
-        self.name = name
-        self.reset_type = reset_type
-        self.limit = limit
-        self.current_usage = current_usage
-        self.unit = unit.value if isinstance(unit, ResourceUnit) else unit
-
-        # Sliding-window specific
-        if reset_type == ResetType.SLIDING_WINDOW and window_seconds is None:
-            raise ValueError("window_seconds required for sliding_window")
+    def __init__(self, window_seconds: int):
         self.window_seconds = window_seconds
 
-        # Cron specific
-        self.cron_pattern: Optional[CronPattern] = None
-        if reset_type == ResetType.CRON:
-            if isinstance(cron_pattern, CronFrequency):
-                self.cron_pattern = CronPattern(frequency=cron_pattern)
-            elif isinstance(cron_pattern, str):
-                self.cron_pattern = CronPattern(pattern=cron_pattern)
-            elif isinstance(cron_pattern, CronPattern):
-                self.cron_pattern = cron_pattern
-            else:
-                raise ValueError("cron_pattern required for cron reset")
-        self.last_reset = last_reset or time.time()
-        self.next_reset = (
-            self.cron_pattern.get_next_reset(self.last_reset)
-            if self.cron_pattern
-            else None
-        )
+    def needs_reset(self, last_reset: float) -> bool:
+        return False  # Sliding window doesn't need explicit reset
 
-        # Grouping and thresholds
-        self.metadata = metadata or {}
-        self.metadata.setdefault("group", group)
-        self.soft_threshold = soft_threshold
-        self.hard_threshold = hard_threshold
+    def get_usage_period(self) -> Tuple[float, float]:
+        end_time = time.time()
+        start_time = end_time - self.window_seconds
+        return start_time, end_time
 
-        # Sliding-window history – list[tuple[timestamp, amount]]
-        self.usage_history: List[tuple[float, int]] = []
 
-    # ------------------------------------------------------------------ #
-    #  Core usage API                                                    #
-    # ------------------------------------------------------------------ #
-    def record_usage(self, amount: int = 1) -> bool:
+class FixedScheduleStrategy(ResetStrategy):
+    """Strategy for fixed schedule reset using cron expressions"""
+
+    def __init__(self, cron_expression: str):
+        self.cron_expression = cron_expression
+
+    def needs_reset(self, last_reset: float) -> bool:
+        """Check if we've passed a cron boundary since last reset"""
+        iter = croniter.croniter(self.cron_expression, datetime.fromtimestamp(last_reset))
+        next_time = iter.get_next(datetime)
+        return time.time() >= next_time.timestamp()
+
+    def get_usage_period(self) -> Tuple[float, float]:
+        """For fixed schedule, usage is since last cron execution"""
         now = time.time()
-        self._check_reset(now)
+        iter = croniter.croniter(self.cron_expression, datetime.fromtimestamp(now))
+        last_execution = iter.get_prev(datetime)
+        return last_execution.timestamp(), now
 
-        if self.reset_type == ResetType.SLIDING_WINDOW:
-            self._clean_old_records(now)
-            if 0 < self.limit < (self.current_usage + amount):
-                return False
-            self.usage_history.append((now, amount))
-            self.current_usage += amount
+
+class Resource:
+    """
+    Represents a single resource with multiple constraints and usage tracking.
+    """
+
+    def __init__(self, name: str, group: Optional[str], unit: str,
+                 limits: List[ResourceLimit], current_usage: float = 0,
+                 last_reset_time: Optional[float] = None,
+                 extra_data: Optional[Dict] = None,
+                 manager: Optional['ResourceUsageManager'] = None):
+        """
+        Initialize a Resource instance.
+
+        Args:
+            name (str): Unique resource name.
+            group (str, optional): Group name for categorization.
+            unit (str): Display unit for the resource.
+            limits (List[ResourceLimit]): List of constraints for this resource.
+            current_usage (float): Current usage amount.
+            last_reset_time (float, optional): Timestamp of last reset.
+            extra_data (dict, optional): Additional user data.
+        """
+        self.name = name
+        self.group = group
+        self.unit = unit
+        self.limits = limits
+        self.current_usage = current_usage
+        self.last_reset_time = last_reset_time or time.time()
+        self.created_time = time.time()
+        self.extra_data = extra_data or {}
+        self.manager = manager
+
+        # Default thresholds (80% warning, 95% critical)
+        self.warning_threshold = 0.8
+        self.critical_threshold = 0.95
+
+        # Initialize reset strategies for each limit
+        self.reset_strategies = []
+        for limit in self.limits:
+            self.reset_strategies.append(self._create_reset_strategy(limit))
+
+        # Check if reset is needed
+        self._check_and_reset()
+
+    def _create_reset_strategy(self, limit: ResourceLimit) -> ResetStrategy:
+        """Create appropriate reset strategy based on limit configuration"""
+        reset_type = limit.reset_config.get("type")
+
+        if reset_type == ResetType.SLIDING_WINDOW.value:
+            window_seconds = limit.reset_config.get("window_seconds", 3600)
+            return SlidingWindowStrategy(window_seconds)
+        elif reset_type == ResetType.FIXED_SCHEDULE.value:
+            cron_expression = limit.reset_config.get("cron_expression", "0 0 * * *")
+            return FixedScheduleStrategy(cron_expression)
         else:
-            if 0 < self.limit < (self.current_usage + amount):
-                return False
-            self.current_usage += amount
+            return NoResetStrategy()
+
+    def record_usage(self, quantity: float = 1.0) -> bool:
+        """
+        Record usage of this resource.
+
+        Args:
+            quantity (float): Amount to record.
+
+        Returns:
+            bool: True if usage was recorded successfully.
+        """
+        # Check if we can record this usage
+        if not self._can_use(quantity):
+            return False
+
+        # Record usage in database
+        if self.manager:
+            self.manager._record_usage_event(self.name, quantity)
+
+        self.current_usage += quantity
         return True
 
-    # ------------------------------------------------------------------ #
-    #  Reset handling                                                    #
-    # ------------------------------------------------------------------ #
-    def _check_reset(self, now: float) -> None:
-        if self.reset_type == ResetType.CRON and self.next_reset and now >= self.next_reset:
-            self.reset()
-            self.last_reset = now
-            if self.cron_pattern:
-                self.next_reset = self.cron_pattern.get_next_reset(now)
+    def _can_use(self, quantity: float) -> bool:
+        """Check if the resource can be used with the given quantity"""
+        # Check all limits using the strictest constraint
+        for i, limit in enumerate(self.limits):
+            strategy = self.reset_strategies[i]
+            if not self._check_limit(limit, strategy, quantity):
+                return False
+        return True
 
-    def _clean_old_records(self, now: float) -> None:
-        if self.reset_type != ResetType.SLIDING_WINDOW or not self.window_seconds:
-            return
-        cutoff = now - self.window_seconds
-        self.usage_history = [(ts, amt) for ts, amt in self.usage_history if ts >= cutoff]
-        self.current_usage = sum(amt for _, amt in self.usage_history)
+    def _check_limit(self, limit: ResourceLimit, strategy: ResetStrategy,
+                     quantity: float) -> bool:
+        """Check a specific limit with its reset strategy"""
+        current_usage = self._get_current_usage(strategy)
+        return current_usage + quantity <= limit.max_quantity
 
-    def reset(self) -> None:
-        self.current_usage = 0
-        self.last_reset = time.time()
-        if self.reset_type == ResetType.SLIDING_WINDOW:
-            self.usage_history.clear()
+    def _get_current_usage(self, strategy: ResetStrategy) -> float:
+        """Get current usage based on the reset strategy"""
+        if isinstance(strategy, SlidingWindowStrategy):
+            # For sliding window, calculate usage from history
+            if self.manager:
+                return self.manager._get_window_usage(self.name, strategy)
+        return self.current_usage
 
-    # ------------------------------------------------------------------ #
-    #  Threshold helpers                                                 #
-    # ------------------------------------------------------------------ #
-    def recommendation_status(self) -> Dict[str, Any]:
+    def check_availability(self, required_quantity: float = 1.0) -> AvailabilityStatus:
         """
-        Return availability info:
-        {
-          'available': bool,      # False if hard threshold exceeded
-          'recommended': bool,    # False if soft threshold exceeded
-          'usage_percentage': float
-        }
+        Check availability status of the resource.
+
+        Args:
+            required_quantity (float): Quantity needed.
+
+        Returns:
+            AvailabilityStatus: Availability status.
         """
-        pct = self.get_usage_percentage()
-        usage = self.current_usage
-        hard = self.hard_threshold is not None and usage >= self.hard_threshold
-        soft = self.soft_threshold is not None and usage >= self.soft_threshold
-        return {
-            "available": not hard,
-            "recommended": not soft and not hard,
-            "usage_percentage": pct,
-        }
+        if not self._can_use(required_quantity):
+            return AvailabilityStatus.UNAVAILABLE
 
-    def get_usage_stats(self) -> Dict[str, Any]:
-        """
-        Return a snapshot of the resource's current statistics.
-        """
-        now = time.time()
-        if self.reset_type == ResetType.SLIDING_WINDOW:
-            self._clean_old_records(now)
+        # Find the strictest limit to check against thresholds
+        max_usable = float('inf')
+        for i, limit in enumerate(self.limits):
+            strategy = self.reset_strategies[i]
+            current_usage = self._get_current_usage(strategy)
+            remaining = limit.max_quantity - current_usage
+            if remaining < max_usable:
+                max_usable = remaining
 
-        return {
-            "name": self.name,
-            "current_usage": self.current_usage,
-            "limit": self.limit,
-            "usage_percentage": self.get_usage_percentage(),
-            "unit": self.unit,
-            "reset_type": self.reset_type.value,
-            "last_reset": self.last_reset,
-            "next_reset": self.next_reset,
-            "time_until_reset": self.time_until_reset(),
-            "is_limited": self.is_limited(),
-            "metadata": self.metadata,
-            "soft_threshold": self.soft_threshold,
-            "hard_threshold": self.hard_threshold,
-            "group": self.group,
-        }
+        if max_usable <= 0:
+            return AvailabilityStatus.UNAVAILABLE
 
-    # ------------------------------------------------------------------ #
-    #  Utilities                                                         #
-    # ------------------------------------------------------------------ #
-    def get_usage_percentage(self) -> float:
-        return 0.0 if self.limit == 0 else (self.current_usage / self.limit) * 100
+        usage_ratio = 1 - (max_usable / self._get_max_limit())
 
-    def time_until_reset(self) -> Optional[float]:
-        if self.next_reset is None:
-            return None
-        return max(0.0, self.next_reset - time.time())
+        if usage_ratio >= self.critical_threshold:
+            return AvailabilityStatus.UNAVAILABLE
+        elif usage_ratio >= self.warning_threshold:
+            return AvailabilityStatus.WARNING
+        else:
+            return AvailabilityStatus.AVAILABLE
 
-    def is_limited(self) -> bool:
-        return self.limit > 0
+    def _get_max_limit(self) -> float:
+        """Get the maximum limit value among all constraints"""
+        return max(limit.max_quantity for limit in self.limits)
 
-    @property
-    def group(self) -> str:
-        return self.metadata.get("group", "default")
+    def _check_and_reset(self) -> None:
+        """Check if resource needs reset based on its limits"""
+        for i, limit in enumerate(self.limits):
+            strategy = self.reset_strategies[i]
+            if strategy.needs_reset(self.last_reset_time):
+                self._reset_usage(strategy)
+                break  # Reset once per check
 
-    # ------------------------------------------------------------------ #
-    #  Serialisation                                                     #
-    # ------------------------------------------------------------------ #
+    def _reset_usage(self, strategy: ResetStrategy) -> None:
+        """Reset usage based on strategy"""
+        if isinstance(strategy, (FixedScheduleStrategy, NoResetStrategy)):
+            self.current_usage = 0
+            self.last_reset_time = time.time()
+
+            # Clean up old usage records
+            if self.manager:
+                self.manager._cleanup_old_records(self.name)
+
     def to_dict(self) -> Dict[str, Any]:
-        data = {
+        """Convert resource to dictionary for JSON serialization"""
+        return {
             "name": self.name,
-            "reset_type": self.reset_type.value,
-            "limit": self.limit,
+            "group": self.group,
             "unit": self.unit,
             "current_usage": self.current_usage,
-            "last_reset": self.last_reset,
-            "metadata": self.metadata,
-            "soft_threshold": self.soft_threshold,
-            "hard_threshold": self.hard_threshold,
+            "last_reset_time": self.last_reset_time,
+            "created_time": self.created_time,
+            "warning_threshold": self.warning_threshold,
+            "critical_threshold": self.critical_threshold,
+            "limits": [asdict(limit) for limit in self.limits],
+            "extra_data": self.extra_data
         }
-        if self.reset_type == ResetType.SLIDING_WINDOW:
-            data["window_seconds"] = self.window_seconds
-        if self.reset_type == ResetType.CRON and self.cron_pattern:
-            data["cron_pattern"] = self.cron_pattern.to_dict()
-            data["next_reset"] = self.next_reset
-        return data
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Resource":
-        cp = None
-        if data.get("cron_pattern"):
-            cp = CronPattern.from_dict(data["cron_pattern"])
-        elif data.get("reset_type") == ResetType.CRON.value:
-            cp = CronPattern(frequency=CronFrequency.DAILY)
+    def from_dict(cls, data: Dict[str, Any],
+                  manager: Optional['ResourceUsageManager'] = None) -> 'Resource':
+        """Create Resource from dictionary"""
+        limits = [ResourceLimit(**limit_data) for limit_data in data.get("limits", [])]
 
         return cls(
             name=data["name"],
-            reset_type=ResetType(data["reset_type"]),
-            limit=data["limit"],
-            unit=data["unit"],
-            window_seconds=data.get("window_seconds"),
-            cron_pattern=cp,
-            last_reset=data.get("last_reset"),
+            group=data.get("group"),
+            unit=data.get("unit", "count"),
+            limits=limits,
             current_usage=data.get("current_usage", 0),
-            metadata=data.get("metadata"),
-            soft_threshold=data.get("soft_threshold"),
-            hard_threshold=data.get("hard_threshold"),
+            last_reset_time=data.get("last_reset_time"),
+            extra_data=data.get("extra_data", {}),
+            manager=manager
         )
 
 
-# --------------------------------------------------------------------------- #
-#  Manager                                                                    #
-# --------------------------------------------------------------------------- #
 class ResourceUsageManager:
     """
-    Thread-safe manager for many resources with persistence.
+    A comprehensive resource usage manager that handles various types of resource limitations
+    with multiple constraint types and reset mechanisms.
     """
 
     def __init__(self, db_path: str = "resource_usage.db"):
+        """
+        Initialize the ResourceUsageManager with SQLite database storage.
+
+        Args:
+            db_path (str): Path to the SQLite database file
+        """
         self.db_path = db_path
-        self.resources: Dict[str, Resource] = {}
         self.lock = threading.RLock()
+        self.resources: Dict[str, Resource] = {}
+        self.groups: Dict[str, List[str]] = {}
+
+        # Initialize database and load existing resources
         self._init_database()
         self._load_resources()
 
-    # ------------------------------------------------------------------ #
-    #  Database bootstrap                                                #
-    # ------------------------------------------------------------------ #
     def _init_database(self) -> None:
-        ddl = """
-        CREATE TABLE IF NOT EXISTS resources (
-            name             TEXT PRIMARY KEY,
-            reset_type       TEXT NOT NULL,
-            limit_value      INTEGER NOT NULL,
-            unit             TEXT NOT NULL,
-            window_seconds   INTEGER,
-            cron_pattern     TEXT,
-            last_reset       REAL NOT NULL,
-            next_reset       REAL,
-            current_usage    INTEGER NOT NULL,
-            metadata         TEXT,
-            soft_threshold   INTEGER,
-            hard_threshold   INTEGER,
-            created_at       REAL NOT NULL,
-            updated_at       REAL NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS usage_history (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            resource_name TEXT NOT NULL,
-            timestamp     REAL NOT NULL,
-            amount        INTEGER NOT NULL,
-            FOREIGN KEY (resource_name) REFERENCES resources(name) ON DELETE CASCADE
-        );
-        """
+        """Initialize database tables"""
         with sqlite3.connect(self.db_path) as conn:
-            conn.executescript(ddl)
+            cursor = conn.cursor()
 
-    # ------------------------------------------------------------------ #
-    #  Load resources + history                                          #
-    # ------------------------------------------------------------------ #
+            # Resources table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS resources (
+                    name TEXT PRIMARY KEY,
+                    resource_group TEXT,
+                    unit TEXT,
+                    limits_json TEXT,
+                    current_usage REAL DEFAULT 0,
+                    last_reset_time REAL,
+                    created_time REAL NOT NULL,
+                    extra_data TEXT,
+                    warning_threshold REAL DEFAULT 0.8,
+                    critical_threshold REAL DEFAULT 0.95
+                )
+            """)
+
+            # Usage history table for sliding window resources
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS usage_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    resource_name TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    timestamp REAL NOT NULL,
+                    FOREIGN KEY (resource_name) REFERENCES resources (name)
+                )
+            """)
+
+            conn.commit()
+
     def _load_resources(self) -> None:
+        """Load resources from database on startup"""
         with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM resources")
-            for row in cur.fetchall():
-                try:
-                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
-                    data = {
-                        "name": row["name"],
-                        "reset_type": ResetType(row["reset_type"]),
-                        "limit": row["limit_value"],
-                        "unit": row["unit"],
-                        "window_seconds": row["window_seconds"],
-                        "cron_pattern": json.loads(row["cron_pattern"])
-                        if row["cron_pattern"]
-                        else None,
-                        "last_reset": row["last_reset"],
-                        "current_usage": row["current_usage"],
-                        "metadata": meta,
-                        "soft_threshold": row["soft_threshold"],
-                        "hard_threshold": row["hard_threshold"],
-                    }
-                    res = Resource.from_dict(data)
-                    self.resources[res.name] = res
-                except Exception as exc:
-                    logger.error("Skipping corrupted row %s: %s", row["name"], exc)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resources")
 
-            # Reload sliding-window history
-            cur.execute("SELECT resource_name, timestamp, amount FROM usage_history")
-            for row in cur.fetchall():
-                res = self.resources.get(row["resource_name"])
-                if res and res.reset_type == ResetType.SLIDING_WINDOW:
-                    res.usage_history.append((row["timestamp"], row["amount"]))
-            logger.info("Loaded %d resources", len(self.resources))
+            for row in cursor.fetchall():
+                (name, group, unit, limits_json, current_usage,
+                 last_reset_time, created_time, extra_data,
+                 warning_threshold, critical_threshold) = row
 
-    # ------------------------------------------------------------------ #
-    #  Resource lifecycle                                                #
-    # ------------------------------------------------------------------ #
-    def create_resource(
-        self,
-        name: Optional[str] = None,
-        reset_type: ResetType = ResetType.UNLIMITED,
-        limit: int = 0,
-        unit: Union[ResourceUnit, str] = ResourceUnit.COUNT,
-        window_seconds: Optional[int] = None,
-        cron_pattern: Optional[Union[CronPattern, str, CronFrequency]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        group: str = "default",
-        soft_threshold: Optional[int] = None,
-        hard_threshold: Optional[int] = None,
-    ) -> Resource:
-        if name is None:
-            name = str(uuid.uuid4())
+                limits_data = json.loads(limits_json)
+                limits = [ResourceLimit(**limit_data) for limit_data in limits_data]
+
+                resource = Resource(
+                    name=name,
+                    group=group,
+                    unit=unit,
+                    limits=limits,
+                    current_usage=current_usage,
+                    last_reset_time=last_reset_time,
+                    extra_data=json.loads(extra_data) if extra_data else {},
+                    manager=self
+                )
+
+                resource.warning_threshold = warning_threshold
+                resource.critical_threshold = critical_threshold
+
+                self.resources[name] = resource
+
+                # Add to group
+                if group:
+                    if group not in self.groups:
+                        self.groups[group] = []
+                    self.groups[group].append(name)
+
+                print(f"Loaded resource: {name} (group: {group}), usage: {current_usage}")
+
+    def _record_usage_event(self, resource_name: str, quantity: float) -> None:
+        """Record a usage event in the database"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO usage_history (resource_name, quantity, timestamp)
+                VALUES (?, ?, ?)
+            """, (resource_name, quantity, time.time()))
+            conn.commit()
+
+    def _get_window_usage(self, resource_name: str, strategy: SlidingWindowStrategy) -> float:
+        """Calculate usage within a time window"""
+        start_time, end_time = strategy.get_usage_period()
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COALESCE(SUM(quantity), 0) 
+                FROM usage_history 
+                WHERE resource_name = ? AND timestamp BETWEEN ? AND ?
+            """, (resource_name, start_time, end_time))
+
+            result = cursor.fetchone()
+            return result[0] if result else 0.0
+
+    def _cleanup_old_records(self, resource_name: str, older_than_days: int = 30) -> None:
+        """Clean up old usage history records"""
+        cutoff_time = time.time() - (older_than_days * 24 * 3600)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM usage_history 
+                WHERE resource_name = ? AND timestamp < ?
+            """, (resource_name, cutoff_time))
+            conn.commit()
+
+    def manual_reset(self, resource_name: str) -> bool:
+        """
+        Manually reset a resource's usage to zero.
+
+        Args:
+            resource_name (str): Name of the resource to reset.
+
+        Returns:
+            bool: True if reset successful, False if resource doesn't exist.
+        """
         with self.lock:
-            if name in self.resources:
-                raise ValueError(f"Resource '{name}' already exists")
-            res = Resource(
-                name=name,
-                reset_type=reset_type,
-                limit=limit,
-                unit=unit,
-                window_seconds=window_seconds,
-                cron_pattern=cron_pattern,
-                metadata=metadata,
-                group=group,
-                soft_threshold=soft_threshold,
-                hard_threshold=hard_threshold,
-            )
-            self.resources[name] = res
-            self._save_resource(res)
-            return res
-
-    def get_resource(self, name: str) -> Optional[Resource]:
-        return self.resources.get(name)
-
-    def delete_resource(self, name: str) -> bool:
-        with self.lock:
-            if name not in self.resources:
+            if resource_name not in self.resources:
                 return False
-            del self.resources[name]
+
+            resource = self.resources[resource_name]
+            resource.current_usage = 0
+            resource.last_reset_time = time.time()
+
+            # Clear usage history for this resource
             with sqlite3.connect(self.db_path) as conn:
-                cur = conn.cursor()
-                cur.execute("DELETE FROM resources WHERE name = ?", (name,))
-                cur.execute("DELETE FROM usage_history WHERE resource_name = ?", (name,))
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM usage_history WHERE resource_name = ?",
+                               (resource_name,))
                 conn.commit()
+
+            self._update_resource_in_db(resource)
             return True
 
-    # ------------------------------------------------------------------ #
-    #  Usage API                                                         #
-    # ------------------------------------------------------------------ #
-    def record_usage(self, resource_name: str, amount: int = 1) -> bool:
-        with self.lock:
-            res = self.resources.get(resource_name)
-            if res is None:
-                raise ValueError(f"Resource '{resource_name}' not found")
-            ok = res.record_usage(amount)
-            if ok:
-                self._save_resource(res)
-                if res.reset_type == ResetType.SLIDING_WINDOW:
-                    self._record_usage_history(resource_name, time.time(), amount)
-            return ok
-
-    def _record_usage_history(self, name: str, ts: float, amount: int) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO usage_history(resource_name, timestamp, amount) VALUES (?,?,?)",
-                (name, ts, amount),
-            )
-            conn.commit()
-
-    def reset_resource(self, name: str) -> None:
-        with self.lock:
-            res = self.resources.get(name)
-            if res is None:
-                raise ValueError(f"Resource '{name}' not found")
-            res.reset()
-            self._save_resource(res)
-
-    def set_usage(self, name: str, usage: int) -> None:
-        with self.lock:
-            res = self.resources.get(name)
-            if res is None:
-                raise ValueError(f"Resource '{name}' not found")
-            res.current_usage = usage
-            self._save_resource(res)
-
-    def set_limit(self, name: str, limit: int) -> None:
-        with self.lock:
-            res = self.resources.get(name)
-            if res is None:
-                raise ValueError(f"Resource '{name}' not found")
-            res.limit = limit
-            self._save_resource(res)
-
-    # ------------------------------------------------------------------ #
-    #  Threshold / availability API                                      #
-    # ------------------------------------------------------------------ #
-    def check_availability(self, name: str) -> Optional[Dict[str, Any]]:
-        res = self.resources.get(name)
-        return None if res is None else res.recommendation_status()
-
-    # ------------------------------------------------------------------ #
-    #  Group helpers                                                     #
-    # ------------------------------------------------------------------ #
-    def list_groups(self) -> List[str]:
-        return sorted({res.group for res in self.resources.values()})
-
-    def get_group_stats(self, group: str) -> Dict[str, Any]:
-        members = [r for r in self.resources.values() if r.group == group]
-        return {
-            "group": group,
-            "member_count": len(members),
-            "total_usage": sum(r.current_usage for r in members),
-            "total_limit": sum(r.limit for r in members if r.is_limited()),
-            "resources": {r.name: r.get_usage_stats() for r in members},
-        }
-
-    def recommend_from_group(
-        self,
-        group: str,
-        *,
-        prefer_highest_usage: bool = True,
-    ) -> Optional[Resource]:
+    def calibrate_usage(self, resource_name: str, new_usage: float) -> bool:
         """
-        Pick ONE available resource from the group.
-        Available: hard threshold not exceeded.
-        Recommended: soft threshold not exceeded.
-        If prefer_highest_usage=True  →  take highest usage among recommended,
-        otherwise lowest usage among recommended.
-        Falls back to any available (non-recommended) if none recommended.
+        Manually set/calibrate the current usage of a resource.
+
+        Args:
+            resource_name (str): Name of the resource.
+            new_usage (float): New usage value to set.
+
+        Returns:
+            bool: True if calibration successful, False if resource doesn't exist.
         """
-        candidates = [r for r in self.resources.values() if r.group == group]
-        if not candidates:
-            return None
-
-        # 1. Only recommended
-        recommended = [
-            r for r in candidates if r.recommendation_status()["recommended"]
-        ]
-        if recommended:
-            key = (lambda r: r.current_usage) if prefer_highest_usage else (
-                lambda r: -r.current_usage
-            )
-            return max(recommended, key=key)
-
-        # 2. Any available
-        available = [r for r in candidates if r.recommendation_status()["available"]]
-        if available:
-            key = (lambda r: r.current_usage) if prefer_highest_usage else (
-                lambda r: -r.current_usage
-            )
-            return max(available, key=key)
-
-        return None
-
-    # ------------------------------------------------------------------ #
-    #  Statistics / export                                               #
-    # ------------------------------------------------------------------ #
-    def get_usage_stats(self, name: str) -> Optional[Dict[str, Any]]:
-        res = self.resources.get(name)
-        return None if res is None else res.get_usage_stats()
-
-    def get_all_usage_stats(self) -> Dict[str, Dict[str, Any]]:
-        return {n: r.get_usage_stats() for n, r in self.resources.items()}
-
-    def export_resources(self) -> List[Dict[str, Any]]:
-        return [r.to_dict() for r in self.resources.values()]
-
-    def import_resources(self, data: List[Dict[str, Any]]) -> None:
         with self.lock:
-            for item in data:
-                try:
-                    res = Resource.from_dict(item)
-                    self.resources[res.name] = res
-                    self._save_resource(res)
-                except Exception as exc:
-                    raise ValueError(f"Invalid resource data: {exc}") from exc
+            if resource_name not in self.resources:
+                return False
 
-    # ------------------------------------------------------------------ #
-    #  Persistence                                                       #
-    # ------------------------------------------------------------------ #
-    def _save_resource(self, res: Resource) -> None:
-        with self.lock, sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            cron_json = json.dumps(res.cron_pattern.to_dict()) if res.cron_pattern else None
-            meta_json = json.dumps(res.metadata) if res.metadata else None
-            now = time.time()
+            resource = self.resources[resource_name]
+            resource.current_usage = new_usage
+            resource.last_reset_time = time.time()
 
-            cur.execute("SELECT 1 FROM resources WHERE name = ?", (res.name,))
-            exists = cur.fetchone() is not None
+            self._update_resource_in_db(resource)
+            return True
 
-            if exists:
-                cur.execute(
-                    """
-                    UPDATE resources
-                    SET reset_type = ?, limit_value = ?, unit = ?, window_seconds = ?,
-                        cron_pattern = ?, last_reset = ?, next_reset = ?, current_usage = ?,
-                        metadata = ?, soft_threshold = ?, hard_threshold = ?, updated_at = ?
-                    WHERE name = ?
-                    """,
-                    (
-                        res.reset_type.value,
-                        res.limit,
-                        res.unit,
-                        res.window_seconds,
-                        cron_json,
-                        res.last_reset,
-                        res.next_reset,
-                        res.current_usage,
-                        meta_json,
-                        res.soft_threshold,
-                        res.hard_threshold,
-                        now,
-                        res.name,
-                    ),
-                )
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO resources
-                    (name, reset_type, limit_value, unit, window_seconds, cron_pattern,
-                     last_reset, next_reset, current_usage, metadata,
-                     soft_threshold, hard_threshold, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        res.name,
-                        res.reset_type.value,
-                        res.limit,
-                        res.unit,
-                        res.window_seconds,
-                        cron_json,
-                        res.last_reset,
-                        res.next_reset,
-                        res.current_usage,
-                        meta_json,
-                        res.soft_threshold,
-                        res.hard_threshold,
-                        now,
-                        now,
-                    ),
-                )
-            conn.commit()
+    def get_statistics(self, resource_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get comprehensive statistics for a resource.
 
-    # ------------------------------------------------------------------ #
-    #  Maintenance                                                       #
-    # ------------------------------------------------------------------ #
-    def cleanup_old_usage_data(self, older_than_days: int = 30) -> int:
-        cutoff = time.time() - older_than_days * 86400
+        Args:
+            resource_name (str): Name of the resource.
+
+        Returns:
+            Optional[Dict]: Statistics dictionary or None if resource doesn't exist.
+        """
+        with self.lock:
+            if resource_name not in self.resources:
+                return None
+
+            resource = self.resources[resource_name]
+            stats = resource.to_dict()
+
+            # Add additional statistics
+            stats['availability_status'] = resource.check_availability().value
+
+            # Calculate usage percentages for each limit
+            usage_breakdown = []
+            for i, limit in enumerate(resource.limits):
+                strategy = resource.reset_strategies[i]
+                current_usage = resource._get_current_usage(strategy)
+                usage_pct = (current_usage / limit.max_quantity) * 100
+
+                usage_breakdown.append({
+                    'limit_name': limit.limit_name,
+                    'max_quantity': limit.max_quantity,
+                    'current_usage': current_usage,
+                    'usage_percentage': usage_pct,
+                    'remaining': limit.max_quantity - current_usage
+                })
+
+            stats['usage_breakdown'] = usage_breakdown
+            stats['strictest_limit'] = min(
+                usage_breakdown,
+                key=lambda x: x['remaining']
+            ) if usage_breakdown else None
+
+            return stats
+
+    def export_configuration(self, resource_name: str) -> Optional[str]:
+        """
+        Export resource configuration as JSON.
+
+        Args:
+            resource_name (str): Name of the resource.
+
+        Returns:
+            Optional[str]: JSON string of configuration, or None if resource doesn't exist.
+        """
+        with self.lock:
+            if resource_name not in self.resources:
+                return None
+
+            resource = self.resources[resource_name]
+            config = resource.to_dict()
+            return json.dumps(config, indent=2, default=str)
+
+    def import_configuration(self, config_json: str) -> str:
+        """
+        Import resource configuration from JSON.
+
+        Args:
+            config_json (str): JSON string containing resource configuration.
+
+        Returns:
+            str: Name of the imported resource.
+        """
+        config = json.loads(config_json)
+        resource = Resource.from_dict(config, self)
+
+        with self.lock:
+            if resource.name in self.resources:
+                raise ValueError(f"Resource '{resource.name}' already exists")
+
+            self.resources[resource.name] = resource
+            self._save_resource_to_db(resource)
+
+            if resource.group:
+                if resource.group not in self.groups:
+                    self.groups[resource.group] = []
+                self.groups[resource.group].append(resource.name)
+
+            return resource.name
+
+    def _save_resource_to_db(self, resource: Resource) -> None:
+        """Save resource to database"""
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM usage_history WHERE timestamp < ?", (cutoff,))
-            deleted = cur.rowcount
+            cursor = conn.cursor()
+
+            limits_json = json.dumps([asdict(limit) for limit in resource.limits])
+            extra_data_json = json.dumps(resource.extra_data)
+
+            cursor.execute("""
+                INSERT OR REPLACE INTO resources 
+                (name, resource_group, unit, limits_json, current_usage, 
+                 last_reset_time, created_time, extra_data, warning_threshold, critical_threshold)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (resource.name, resource.group, resource.unit, limits_json,
+                  resource.current_usage, resource.last_reset_time,
+                  resource.created_time, extra_data_json,
+                  resource.warning_threshold, resource.critical_threshold))
+
             conn.commit()
-        return deleted
+
+    def _update_resource_in_db(self, resource: Resource) -> None:
+        """Update resource in database"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                UPDATE resources 
+                SET current_usage = ?, last_reset_time = ?, extra_data = ?
+                WHERE name = ?
+            """, (resource.current_usage, resource.last_reset_time,
+                  json.dumps(resource.extra_data), resource.name))
+
+            conn.commit()
+
+    def create_resource(self, name: Optional[str] = None, group: Optional[str] = None,
+                        unit: str = "count", limits: Optional[List[ResourceLimit]] = None) -> str:
+        """
+        Create a new resource with automatic name generation if not provided.
+
+        Args:
+            name (str, optional): Unique resource name. Auto-generated if None.
+            group (str, optional): Resource group name.
+            unit (str): Measurement unit for display purposes.
+            limits (List[ResourceLimit]): List of limits for this resource.
+
+        Returns:
+            str: The resource name (generated or provided).
+        """
+        with self.lock:
+            if name is None:
+                name = f"resource_{int(time.time())}_{len(self.resources)}"
+
+            if name in self.resources:
+                raise ValueError(f"Resource '{name}' already exists")
+
+            if limits is None:
+                limits = [ResourceLimit(max_quantity=1000, reset_config={"type": ResetType.NONE.value})]
+
+            resource = Resource(
+                name=name,
+                group=group,
+                unit=unit,
+                limits=limits,
+                current_usage=0,
+                last_reset_time=time.time(),
+                extra_data={}
+            )
+
+            self.resources[name] = resource
+
+            if group:
+                if group not in self.groups:
+                    self.groups[group] = []
+                self.groups[group].append(name)
+
+            # Save to database
+            self._save_resource_to_db(resource)
+
+            return name
+
+    def record_usage(self, resource_name: str, quantity: float = 1.0) -> bool:
+        """
+        Record usage of a resource.
+
+        Args:
+            resource_name (str): Name of the resource.
+            quantity (float): Amount of resource used.
+
+        Returns:
+            bool: True if usage was recorded successfully, False if resource doesn't exist.
+        """
+        with self.lock:
+            if resource_name not in self.resources:
+                return False
+
+            resource = self.resources[resource_name]
+            success = resource.record_usage(quantity)
+
+            if success:
+                self._update_resource_in_db(resource)
+
+            return success
+
+    def check_availability(self, resource_name: str, required_quantity: float = 1.0) -> AvailabilityStatus:
+        """
+        Check availability status of a resource.
+
+        Args:
+            resource_name (str): Name of the resource.
+            required_quantity (float): Quantity needed.
+
+        Returns:
+            AvailabilityStatus: Availability status.
+        """
+        with self.lock:
+            if resource_name not in self.resources:
+                return AvailabilityStatus.UNAVAILABLE
+
+            resource = self.resources[resource_name]
+            return resource.check_availability(required_quantity)
+
+    def get_recommended_resource(self, group: str) -> Optional[str]:
+        """
+        Get a recommended resource from a group that has the highest usage
+        while still being available (to avoid fragmentation).
+
+        Args:
+            group (str): Group name.
+
+        Returns:
+            Optional[str]: Recommended resource name or None if no available resources.
+        """
+        with self.lock:
+            if group not in self.groups:
+                return None
+
+            available_resources = []
+            for resource_name in self.groups[group]:
+                resource = self.resources[resource_name]
+                status = resource.check_availability(1.0)
+                if status != AvailabilityStatus.UNAVAILABLE:
+                    # Prefer resources with higher usage to avoid fragmentation
+                    available_resources.append((resource.current_usage, resource_name))
+
+            if not available_resources:
+                return None
+
+            # Return the resource with highest current usage
+            available_resources.sort(reverse=True)
+            return available_resources[0][1]
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-
-if __name__ == '__main__':
-    manager = ResourceUsageManager()
-
-    # Create two resources in group "openai"
-    manager.create_resource(
-        name="gpt4-rpm",
-        reset_type=ResetType.SLIDING_WINDOW,
-        limit=10_000,
-        window_seconds=60,
-        group="openai",
-        soft_threshold=8_000,
-        hard_threshold=10_000,
+# Convenience functions for common resource types
+def create_hourly_limit(manager: ResourceUsageManager, name: str, limit: int,
+                        group: str = "hourly") -> str:
+    """Create a resource that resets hourly"""
+    resource_limit = ResourceLimit(
+        max_quantity=limit,
+        reset_config={"type": ResetType.FIXED_SCHEDULE.value, "cron_expression": "0 * * * *"},
+        limit_name="hourly"
     )
-    manager.create_resource(
-        name="gpt4-tpm",
-        reset_type=ResetType.SLIDING_WINDOW,
-        limit=300_000,
-        window_seconds=60,
-        group="openai",
-        soft_threshold=250_000,
-        hard_threshold=300_000,
+    return manager.create_resource(name=name, group=group, unit="requests", limits=[resource_limit])
+
+
+def create_daily_limit(manager: ResourceUsageManager, name: str, limit: int,
+                       group: str = "daily") -> str:
+    """Create a resource that resets daily at midnight"""
+    resource_limit = ResourceLimit(
+        max_quantity=limit,
+        reset_config={"type": ResetType.FIXED_SCHEDULE.value, "cron_expression": "0 0 * * *"},
+        limit_name="daily"
     )
+    return manager.create_resource(name=name, group=group, unit="uses", limits=[resource_limit])
 
-    # Use the recommendation API
-    best = manager.recommend_from_group("openai")
-    if best:
-        print("Recommended:", best.name, best.current_usage)
-    else:
-        print("No available resource in group")
 
-    # Check single resource
-    print(manager.check_availability("gpt4-rpm"))
-    # {'available': True, 'recommended': False, 'usage_percentage': 85.0}
+def create_sliding_window_limit(manager: ResourceUsageManager, name: str, limit: int,
+                                window_seconds: int, group: str = "sliding") -> str:
+    """Create a sliding window limited resource"""
+    resource_limit = ResourceLimit(
+        max_quantity=limit,
+        reset_config={"type": ResetType.SLIDING_WINDOW.value, "window_seconds": window_seconds},
+        limit_name="sliding_window"
+    )
+    return manager.create_resource(name=name, group=group, unit="requests", limits=[resource_limit])
+
+
+# Usage Example and Convenience Functions
+def create_rate_limit_resource(manager: ResourceUsageManager, name: str, requests_per_minute: int,
+                               group: str = "api") -> str:
+    """Convenience function to create a rate-limited resource"""
+    limit = ResourceLimit(
+        max_quantity=requests_per_minute,
+        reset_config={"type": ResetType.SLIDING_WINDOW.value, "window_seconds": 60}
+    )
+    return manager.create_resource(name=name, group=group, unit="requests", limits=[limit])
+
+
+def main():
+    # Create manager instance
+    manager = ResourceUsageManager("test.db")
+
+    # Create a rate-limited API resource
+    api_resource = create_rate_limit_resource(manager, "api_requests", 1000, "api")
+
+    # Check availability
+    status = manager.check_availability(api_resource, 1)
+    print(f"API availability: {status}")
+
+    # Record usage
+    manager.record_usage(api_resource, 1)
+
+    # Get recommended resource from group
+    recommended = manager.get_recommended_resource("api")
+    print(f"Recommended resource: {recommended}")
+
+
+
+# Example usage
+if __name__ == "__main__":
+    main()
