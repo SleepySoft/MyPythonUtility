@@ -250,6 +250,7 @@ class PluginManager:
 
             if not self.__check_required_functions(module):
                 logger.warning(f"Plugin {plugin_name} lacks required functions")
+                sys.modules.pop(module_name, None)
                 return None
             return PluginWrapper(self, plugin_name, file_path, module)
         except Exception as e:
