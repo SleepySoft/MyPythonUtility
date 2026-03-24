@@ -132,21 +132,21 @@ class DictPrinter:
         if colorize is None:
             colorize = HAS_COLORAMA and sys.stdout.isatty()
 
-        # 超出最大深度时返回简洁表示
+            # 超出最大深度时返回简洁表示
         if current_depth >= max_depth:
             return f"{cls._color_wrap('...', 'dim', colorize)}"
 
-        # 处理排序
-        dict_items = data.items()
+        # 处理排序 (注意这里转成了 list，为了方便获取长度和下标)
+        dict_items = list(data.items())
         if sort_keys:
             dict_items = sorted(dict_items)
 
-        # 构建输出字符串
         output = []
         prefix = ' ' * indent * current_depth
         output.append(f"{prefix}{{")
 
-        for key, value in dict_items:
+        total_items = len(dict_items)
+        for i, (key, value) in enumerate(dict_items):
             key_str = cls._format_key(key, colorize)
             value_str = cls._format_value(
                 value,
@@ -156,7 +156,11 @@ class DictPrinter:
                 max_depth,
                 current_depth + 1
             )
-            line = f"{prefix}  {key_str}: {value_str}"
+
+            # 判断是否为最后一个元素，如果不是则在末尾添加逗号
+            comma = "," if i < total_items - 1 else ""
+            line = f"{prefix}  {key_str}: {value_str}{comma}"
+
             output.append(line)
 
         output.append(f"{prefix}}}")
@@ -182,7 +186,7 @@ class DictPrinter:
     @classmethod
     def _format_key(cls, key: Any, colorize: bool) -> str:
         """格式化键"""
-        key_str = json.dumps(str(key))  # 处理特殊字符
+        key_str = json.dumps(str(key), ensure_ascii=False)
         return cls._color_wrap(key_str, 'key', colorize)
 
     @classmethod
@@ -251,7 +255,7 @@ class DictPrinter:
         elif isinstance(value, (int, float)):
             return cls._color_wrap(str(value), 'number', colorize)
         elif isinstance(value, str):
-            quoted = json.dumps(value)
+            quoted = json.dumps(value, ensure_ascii=False)
             return cls._color_wrap(quoted, 'string', colorize)
         elif isinstance(value, datetime.datetime):
             return cls._color_wrap(f"<DateTime {value.isoformat()}>", 'type', colorize)

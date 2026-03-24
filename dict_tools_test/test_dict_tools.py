@@ -26,6 +26,7 @@ def test_dict_printer():
                 }
             }
         },
+        '中文键': '中文值',
         "none_field": None
     }
 
