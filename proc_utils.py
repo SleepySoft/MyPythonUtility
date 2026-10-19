@@ -22,11 +22,15 @@ def _get_logical_name(proc):
 
         # Check if it's a Python process
         if 'python' in name and cmdline:
+            # 调试器包装（PyCharm pydevd 等）：真实脚本在 --file 参数之后
+            for i, arg in enumerate(cmdline):
+                if arg == '--file' and i + 1 < len(cmdline) and cmdline[i + 1].endswith('.py'):
+                    return os.path.basename(cmdline[i + 1]).lower()
             # Look for the first argument ending in .py
             for arg in cmdline:
                 if arg.endswith('.py'):
                     # Return just the filename, not full path, for easier matching
-                    return os.path.basename(arg)
+                    return os.path.basename(arg).lower()
         return name
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return ""
