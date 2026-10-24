@@ -1,0 +1,5 @@
+# Python 运行时生成文件
+__pycache__/
+*.py[codz]
+.pytest_cache/
+
